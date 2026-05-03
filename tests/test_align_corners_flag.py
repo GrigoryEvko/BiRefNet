@@ -68,6 +68,66 @@ def test_birefnet_falls_back_to_true_when_config_lacks_flag():
     assert bool(getattr(_MinimalConfig(), "align_corners", True)) is True
 
 
+def test_every_internal_interpolate_uses_the_flag():
+    """Strong plumbing check: monkey-patch F.interpolate during a forward pass
+    and assert every call's align_corners kwarg matches the model's _ac flag.
+
+    A regression where someone hardcodes `align_corners=False` at a new call
+    site would otherwise silently slip through the property-style checks.
+    """
+    pytest.importorskip("kornia")
+    pytest.importorskip("torch")
+
+    import torch
+    import torch.nn.functional as F
+    import config as _config
+
+    _orig = _config.Config.__init__
+    def _safe(self):
+        try:
+            _orig(self)
+        except FileNotFoundError:
+            pass
+    _config.Config.__init__ = _safe
+    try:
+        from models.birefnet import BiRefNet
+        model = BiRefNet(bb_pretrained=False).eval()
+        # Lock in fp32 weights and a small input that the model accepts.
+        x = torch.zeros(1, 3, 64, 64)
+
+        captured: list = []
+        real_interpolate = F.interpolate
+
+        def spy_interpolate(*args, **kwargs):
+            captured.append(kwargs.get("align_corners", "<absent>"))
+            return real_interpolate(*args, **kwargs)
+
+        F.interpolate = spy_interpolate
+        try:
+            with torch.no_grad():
+                model(x)
+        finally:
+            F.interpolate = real_interpolate
+
+        # Filter out the bicubic upsamples (those use align_corners=False
+        # at the user/eval boundary, which is a deliberate choice). The
+        # bilinear sites in the model graph must follow the flag.
+        # Easiest invariant: every captured align_corners is either True
+        # (matches model._ac) or False (the boundary upsamples we don't own).
+        # In the model graph specifically we want every kwarg == model._ac.
+        # Since BiRefNet itself doesn't call F.interpolate with bicubic in
+        # its forward, every captured value should equal model._ac.
+        assert captured, "monkey-patch never fired — model didn't call F.interpolate?"
+        ac = model._ac
+        for i, v in enumerate(captured):
+            assert v == ac, (
+                f"F.interpolate call #{i} used align_corners={v!r} "
+                f"but model._ac={ac!r} — a hardcoded site slipped through"
+            )
+    finally:
+        _config.Config.__init__ = _orig
+
+
 def test_align_corners_actually_changes_interpolation():
     """Sanity: the flag's value really does flip F.interpolate behavior.
 
