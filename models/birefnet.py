@@ -60,37 +60,45 @@ class BiRefNet(
                 if 'bb.' in key and 'refiner.' not in key:
                     value.requires_grad = False
 
-    def forward_enc(self, x):
+    def _run_backbone(self, x):
+        """Run the backbone with the right call sequence for both conv-based
+        (vgg/resnet, exposed as conv1..conv4 attributes) and feature-pyramid
+        (Swin / PVT / DINO, callable directly) backbones."""
         if self.config.bb in ['vgg16', 'vgg16bn', 'resnet50']:
-            x1 = self.bb.conv1(x); x2 = self.bb.conv2(x1); x3 = self.bb.conv3(x2); x4 = self.bb.conv4(x3)
-        else:
-            x1, x2, x3, x4 = self.bb(x)
+            x1 = self.bb.conv1(x)
+            x2 = self.bb.conv2(x1)
+            x3 = self.bb.conv3(x2)
+            x4 = self.bb.conv4(x3)
+            return x1, x2, x3, x4
+        return self.bb(x)
+
+    def forward_enc(self, x):
+        x1, x2, x3, x4 = self._run_backbone(x)
         if self.config.mul_scl_ipt:
             B, C, H, W = x.shape
-            x_pyramid = F.interpolate(x, size=(H//2, W//2), mode='bilinear', align_corners=True)
+            x_pyramid = F.interpolate(x, size=(H//2, W//2), mode='bilinear', align_corners=False)
+            # Same backbone code path for both 'cat' and 'add'; previously the
+            # 'add' branch hard-coded `self.bb(x_pyramid)` and crashed for the
+            # vgg/resnet backbones that expose conv1..conv4.
+            x1_, x2_, x3_, x4_ = self._run_backbone(x_pyramid)
             if self.config.mul_scl_ipt == 'cat':
-                if self.config.bb in ['vgg16', 'vgg16bn', 'resnet50']:
-                    x1_ = self.bb.conv1(x_pyramid); x2_ = self.bb.conv2(x1_); x3_ = self.bb.conv3(x2_); x4_ = self.bb.conv4(x3_)
-                else:
-                    x1_, x2_, x3_, x4_ = self.bb(x_pyramid)
-                x1 = torch.cat([x1, F.interpolate(x1_, size=x1.shape[2:], mode='bilinear', align_corners=True)], dim=1)
-                x2 = torch.cat([x2, F.interpolate(x2_, size=x2.shape[2:], mode='bilinear', align_corners=True)], dim=1)
-                x3 = torch.cat([x3, F.interpolate(x3_, size=x3.shape[2:], mode='bilinear', align_corners=True)], dim=1)
-                x4 = torch.cat([x4, F.interpolate(x4_, size=x4.shape[2:], mode='bilinear', align_corners=True)], dim=1)
+                x1 = torch.cat([x1, F.interpolate(x1_, size=x1.shape[2:], mode='bilinear', align_corners=False)], dim=1)
+                x2 = torch.cat([x2, F.interpolate(x2_, size=x2.shape[2:], mode='bilinear', align_corners=False)], dim=1)
+                x3 = torch.cat([x3, F.interpolate(x3_, size=x3.shape[2:], mode='bilinear', align_corners=False)], dim=1)
+                x4 = torch.cat([x4, F.interpolate(x4_, size=x4.shape[2:], mode='bilinear', align_corners=False)], dim=1)
             elif self.config.mul_scl_ipt == 'add':
-                x1_, x2_, x3_, x4_ = self.bb(x_pyramid)
-                x1 = x1 + F.interpolate(x1_, size=x1.shape[2:], mode='bilinear', align_corners=True)
-                x2 = x2 + F.interpolate(x2_, size=x2.shape[2:], mode='bilinear', align_corners=True)
-                x3 = x3 + F.interpolate(x3_, size=x3.shape[2:], mode='bilinear', align_corners=True)
-                x4 = x4 + F.interpolate(x4_, size=x4.shape[2:], mode='bilinear', align_corners=True)
+                x1 = x1 + F.interpolate(x1_, size=x1.shape[2:], mode='bilinear', align_corners=False)
+                x2 = x2 + F.interpolate(x2_, size=x2.shape[2:], mode='bilinear', align_corners=False)
+                x3 = x3 + F.interpolate(x3_, size=x3.shape[2:], mode='bilinear', align_corners=False)
+                x4 = x4 + F.interpolate(x4_, size=x4.shape[2:], mode='bilinear', align_corners=False)
         class_preds = self.cls_head(self.avgpool(x4).view(x4.shape[0], -1)) if self.training and self.config.auxiliary_classification else None
         if self.config.cxt:
             x4 = torch.cat(
                 (
                     *[
-                        F.interpolate(x1, size=x4.shape[2:], mode='bilinear', align_corners=True),
-                        F.interpolate(x2, size=x4.shape[2:], mode='bilinear', align_corners=True),
-                        F.interpolate(x3, size=x4.shape[2:], mode='bilinear', align_corners=True),
+                        F.interpolate(x1, size=x4.shape[2:], mode='bilinear', align_corners=False),
+                        F.interpolate(x2, size=x4.shape[2:], mode='bilinear', align_corners=False),
+                        F.interpolate(x3, size=x4.shape[2:], mode='bilinear', align_corners=False),
                     ][-len(self.config.cxt):],
                     x4
                 ),
@@ -132,6 +140,10 @@ class Decoder(nn.Module):
             self.pyramid_neck_x2 = LateralBlock(channels[2], self.manually_controlled_decoder_in_channels[2])
             self.pyramid_neck_x1 = LateralBlock(channels[3], self.manually_controlled_decoder_in_channels[3])
 
+        # Channel arithmetic for the input-patch (dec_ipt) and decoder blocks.
+        # ipt_blk_out_channels stays defined either way so downstream uses
+        # don't depend on dec_ipt branch coverage.
+        ipt_blk_out_channels = [0, 0, 0, 0]
         if self.config.dec_ipt:
             self.split = self.config.dec_ipt_split
             N_dec_ipt = 64
@@ -155,6 +167,9 @@ class Decoder(nn.Module):
         dec_blk_out_channels = [c for c in bb_neck_out_channels[1:]] + [bb_neck_out_channels[-1] // 2]
         if self.config.dec_ipt:
             dec_blk_in_channels = [bb_neck_out_channels[i] + ipt_blk_out_channels[max(0, i - 1)] for i in range(len(bb_neck_out_channels))]
+        else:
+            # Without dec_ipt the decoder blocks don't get extra ipt channels.
+            dec_blk_in_channels = list(bb_neck_out_channels)
 
         self.decoder_block4 = DecoderBlock(dec_blk_in_channels[0], dec_blk_out_channels[0])
         self.decoder_block3 = DecoderBlock(dec_blk_in_channels[1], dec_blk_out_channels[1])
@@ -195,30 +210,31 @@ class Decoder(nn.Module):
             x, x1, x2, x3, x4 = features
         size_x1_to_x4_template = [(x.shape[2] // (2 ** i), x.shape[3] // (2 ** i)) for i in (2, 3, 4, 5)]
         if self.use_pyramid_neck:
-            x1 = F.interpolate(x1, size=size_x1_to_x4_template[0], mode='bilinear', align_corners=True)
+            x1 = F.interpolate(x1, size=size_x1_to_x4_template[0], mode='bilinear', align_corners=False)
             x1 = self.pyramid_neck_x1(x1)
 
-            x2 = F.interpolate(x2, size=size_x1_to_x4_template[1], mode='bilinear', align_corners=True)
+            x2 = F.interpolate(x2, size=size_x1_to_x4_template[1], mode='bilinear', align_corners=False)
             x2 = self.pyramid_neck_x2(x2)
 
-            x3 = F.interpolate(x3, size=size_x1_to_x4_template[2], mode='bilinear', align_corners=True)
+            x3 = F.interpolate(x3, size=size_x1_to_x4_template[2], mode='bilinear', align_corners=False)
             x3 = self.pyramid_neck_x3(x3)
 
-            x4 = F.interpolate(x4, size=size_x1_to_x4_template[3], mode='bilinear', align_corners=True)
+            x4 = F.interpolate(x4, size=size_x1_to_x4_template[3], mode='bilinear', align_corners=False)
             x4 = self.pyramid_neck_x4(x4)
         outs = []
 
         if self.config.dec_ipt:
             patches_batch = image2patches(x, patch_ref=x4, transformation='b c (hg h) (wg w) -> b (c hg wg) h w') if self.split else x
-            x4 = torch.cat((x4, self.ipt_blk5(F.interpolate(patches_batch, size=x4.shape[2:], mode='bilinear', align_corners=True))), 1)
+            x4 = torch.cat((x4, self.ipt_blk5(F.interpolate(patches_batch, size=x4.shape[2:], mode='bilinear', align_corners=False))), 1)
         p4 = self.decoder_block4(x4)
         m4 = self.conv_ms_spvn_4(p4) if self.config.ms_supervision and self.training else None
         if self.config.out_ref:
             p4_gdt = self.gdt_convs_4(p4)
             if self.training:
-                # >> GT:
-                m4_dia = m4
-                gdt_label_main_4 = gdt_gt * F.interpolate(m4_dia, size=gdt_gt.shape[2:], mode='bilinear', align_corners=True)
+                # >> GT: gdt label needs m4 even when ms_supervision is disabled
+                # (without it the multiplication below crashes with `None * Tensor`).
+                m4_dia = m4 if m4 is not None else self.conv_ms_spvn_4(p4)
+                gdt_label_main_4 = gdt_gt * F.interpolate(m4_dia, size=gdt_gt.shape[2:], mode='bilinear', align_corners=False)
                 outs_gdt_label.append(gdt_label_main_4)
                 # >> Pred:
                 gdt_pred_4 = self.gdt_convs_pred_4(p4_gdt)
@@ -226,12 +242,12 @@ class Decoder(nn.Module):
             gdt_attn_4 = self.gdt_convs_attn_4(p4_gdt).sigmoid()
             # >> Finally:
             p4 = p4 * gdt_attn_4
-        _p4 = F.interpolate(p4, size=x3.shape[2:], mode='bilinear', align_corners=True)
+        _p4 = F.interpolate(p4, size=x3.shape[2:], mode='bilinear', align_corners=False)
         _p3 = _p4 + self.lateral_block4(x3)
 
         if self.config.dec_ipt:
             patches_batch = image2patches(x, patch_ref=_p3, transformation='b c (hg h) (wg w) -> b (c hg wg) h w') if self.split else x
-            _p3 = torch.cat((_p3, self.ipt_blk4(F.interpolate(patches_batch, size=x3.shape[2:], mode='bilinear', align_corners=True))), 1)
+            _p3 = torch.cat((_p3, self.ipt_blk4(F.interpolate(patches_batch, size=x3.shape[2:], mode='bilinear', align_corners=False))), 1)
         p3 = self.decoder_block3(_p3)
         m3 = self.conv_ms_spvn_3(p3) if self.config.ms_supervision and self.training else None
         if self.config.out_ref:
@@ -240,8 +256,8 @@ class Decoder(nn.Module):
                 # >> GT:
                 # m3 --dilation--> m3_dia
                 # G_3^gt * m3_dia --> G_3^m, which is the label of gradient
-                m3_dia = m3
-                gdt_label_main_3 = gdt_gt * F.interpolate(m3_dia, size=gdt_gt.shape[2:], mode='bilinear', align_corners=True)
+                m3_dia = m3 if m3 is not None else self.conv_ms_spvn_3(p3)
+                gdt_label_main_3 = gdt_gt * F.interpolate(m3_dia, size=gdt_gt.shape[2:], mode='bilinear', align_corners=False)
                 outs_gdt_label.append(gdt_label_main_3)
                 # >> Pred:
                 # p3 --conv--BN--> F_3^G, where F_3^G predicts the \hat{G_3} with xx
@@ -252,20 +268,20 @@ class Decoder(nn.Module):
             # >> Finally:
             # p3 = p3 * A_3^G
             p3 = p3 * gdt_attn_3
-        _p3 = F.interpolate(p3, size=x2.shape[2:], mode='bilinear', align_corners=True)
+        _p3 = F.interpolate(p3, size=x2.shape[2:], mode='bilinear', align_corners=False)
         _p2 = _p3 + self.lateral_block3(x2)
 
         if self.config.dec_ipt:
             patches_batch = image2patches(x, patch_ref=_p2, transformation='b c (hg h) (wg w) -> b (c hg wg) h w') if self.split else x
-            _p2 = torch.cat((_p2, self.ipt_blk3(F.interpolate(patches_batch, size=x2.shape[2:], mode='bilinear', align_corners=True))), 1)
+            _p2 = torch.cat((_p2, self.ipt_blk3(F.interpolate(patches_batch, size=x2.shape[2:], mode='bilinear', align_corners=False))), 1)
         p2 = self.decoder_block2(_p2)
         m2 = self.conv_ms_spvn_2(p2) if self.config.ms_supervision and self.training else None
         if self.config.out_ref:
             p2_gdt = self.gdt_convs_2(p2)
             if self.training:
                 # >> GT:
-                m2_dia = m2
-                gdt_label_main_2 = gdt_gt * F.interpolate(m2_dia, size=gdt_gt.shape[2:], mode='bilinear', align_corners=True)
+                m2_dia = m2 if m2 is not None else self.conv_ms_spvn_2(p2)
+                gdt_label_main_2 = gdt_gt * F.interpolate(m2_dia, size=gdt_gt.shape[2:], mode='bilinear', align_corners=False)
                 outs_gdt_label.append(gdt_label_main_2)
                 # >> Pred:
                 gdt_pred_2 = self.gdt_convs_pred_2(p2_gdt)
@@ -273,18 +289,18 @@ class Decoder(nn.Module):
             gdt_attn_2 = self.gdt_convs_attn_2(p2_gdt).sigmoid()
             # >> Finally:
             p2 = p2 * gdt_attn_2
-        _p2 = F.interpolate(p2, size=x1.shape[2:], mode='bilinear', align_corners=True)
+        _p2 = F.interpolate(p2, size=x1.shape[2:], mode='bilinear', align_corners=False)
         _p1 = _p2 + self.lateral_block2(x1)
 
         if self.config.dec_ipt:
             patches_batch = image2patches(x, patch_ref=_p1, transformation='b c (hg h) (wg w) -> b (c hg wg) h w') if self.split else x
-            _p1 = torch.cat((_p1, self.ipt_blk2(F.interpolate(patches_batch, size=x1.shape[2:], mode='bilinear', align_corners=True))), 1)
+            _p1 = torch.cat((_p1, self.ipt_blk2(F.interpolate(patches_batch, size=x1.shape[2:], mode='bilinear', align_corners=False))), 1)
         _p1 = self.decoder_block1(_p1)
-        _p1 = F.interpolate(_p1, size=x.shape[2:], mode='bilinear', align_corners=True)
+        _p1 = F.interpolate(_p1, size=x.shape[2:], mode='bilinear', align_corners=False)
 
         if self.config.dec_ipt:
             patches_batch = image2patches(x, patch_ref=_p1, transformation='b c (hg h) (wg w) -> b (c hg wg) h w') if self.split else x
-            _p1 = torch.cat((_p1, self.ipt_blk1(F.interpolate(patches_batch, size=x.shape[2:], mode='bilinear', align_corners=True))), 1)
+            _p1 = torch.cat((_p1, self.ipt_blk1(F.interpolate(patches_batch, size=x.shape[2:], mode='bilinear', align_corners=False))), 1)
         p1_out = self.conv_out1(_p1)
 
         if self.config.ms_supervision and self.training:
