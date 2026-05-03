@@ -57,7 +57,7 @@ class ASPP(nn.Module):
         x3 = self.aspp3(x)
         x4 = self.aspp4(x)
         x5 = self.global_avg_pool(x)
-        x5 = F.interpolate(x5, size=x1.size()[2:], mode='bilinear', align_corners=True)
+        x5 = F.interpolate(x5, size=x1.size()[2:], mode='bilinear', align_corners=False)
         x = torch.cat((x1, x2, x3, x4, x5), dim=1)
 
         x = self.conv1(x)
@@ -109,7 +109,7 @@ class ASPPDeformable(nn.Module):
         x1 = self.aspp1(x)
         x_aspp_deforms = [aspp_deform(x) for aspp_deform in self.aspp_deforms]
         x5 = self.global_avg_pool(x)
-        x5 = F.interpolate(x5, size=x1.size()[2:], mode='bilinear', align_corners=True)
+        x5 = F.interpolate(x5, size=x1.size()[2:], mode='bilinear', align_corners=False)
         x = torch.cat((x1, *x_aspp_deforms, x5), dim=1)
 
         x = self.conv1(x)
