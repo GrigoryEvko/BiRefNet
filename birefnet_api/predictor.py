@@ -132,7 +132,7 @@ class BiRefNetPredictor:
     def __init__(
         self,
         model: torch.nn.Module,
-        device: Union[str, torch.device] = "cuda",
+        device: Union[str, torch.device] = "auto",
         dtype: Union[str, torch.dtype, None] = "bf16",
         max_edge: int = 2048,
         multiple: int = 32,
@@ -142,7 +142,7 @@ class BiRefNetPredictor:
         channels_last: bool = True,
         buckets: Optional[Sequence[Tuple[int, int]]] = None,
     ):
-        self.device = torch.device(device)
+        self.device = self._resolve_device(device)
         self.amp_dtype = self._resolve_dtype(dtype)
         self.max_edge = int(max_edge)
         self.multiple = int(multiple)
@@ -201,6 +201,38 @@ class BiRefNetPredictor:
             msg = (
                 f"state-dict mismatch loading {ckpt_path!s}: "
                 f"missing={len(missing)} ({miss_preview or '-'}) "
+                f"unexpected={len(unexpected)} ({unx_preview or '-'})"
+            )
+            if strict:
+                raise RuntimeError(msg + " — pass strict=False to tolerate")
+            print(f"[BiRefNetPredictor] {msg}")
+        return cls(model, **kwargs)
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        state_dict: dict,
+        strict: bool = True,
+        **kwargs,
+    ) -> "BiRefNetPredictor":
+        """Build a predictor from an in-memory state_dict (dict of tensors).
+
+        Useful when the caller already loaded the weights (e.g. from a
+        deployment artifact, a model registry, or remote storage) and
+        doesn't want a temp file on disk. Same prefix-stripping and
+        strict-checking semantics as from_checkpoint.
+        """
+        from models.birefnet import BiRefNet
+        from utils import check_state_dict
+        model = BiRefNet(bb_pretrained=False)
+        sd = check_state_dict(dict(state_dict))  # copy: check_state_dict mutates
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing or unexpected:
+            preview_n = 10
+            miss_preview = ', '.join(missing[:preview_n]) + ('...' if len(missing) > preview_n else '')
+            unx_preview = ', '.join(unexpected[:preview_n]) + ('...' if len(unexpected) > preview_n else '')
+            msg = (
+                f"state-dict mismatch: missing={len(missing)} ({miss_preview or '-'}) "
                 f"unexpected={len(unexpected)} ({unx_preview or '-'})"
             )
             if strict:
@@ -349,6 +381,21 @@ class BiRefNetPredictor:
 
     # --- internals ---------------------------------------------------------
 
+    @staticmethod
+    def _resolve_device(device) -> torch.device:
+        """Pick a torch.device, supporting 'auto' for best-available."""
+        if isinstance(device, torch.device):
+            return device
+        if device != "auto":
+            return torch.device(device)
+        # 'auto': prefer CUDA, then MPS (Apple Silicon), then CPU.
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        mps_avail = getattr(getattr(torch.backends, "mps", None), "is_available", lambda: False)
+        if mps_avail():
+            return torch.device("mps")
+        return torch.device("cpu")
+
     def _resolve_dtype(self, dtype) -> Optional[torch.dtype]:
         if dtype is None:
             return None
@@ -393,17 +440,71 @@ class BiRefNetPredictor:
             if (self.amp_dtype is not None and self.device.type == "cuda")
             else nullcontext()
         )
-        with ctx:
-            out = self.model(x)
-            if isinstance(out, (list, tuple)):
-                logits = out[-1]
-            else:
-                logits = out
-            # sigmoid stays in autocast dtype (bf16 if amp on); the upsample
-            # happens in the same dtype to halve interpolate memory at HR.
-            # The fp32 cast moves to the predict() boundary right before
-            # the user receives the mask.
-            return logits.sigmoid()
+        try:
+            with ctx:
+                out = self.model(x)
+                if isinstance(out, (list, tuple)):
+                    logits = out[-1]
+                else:
+                    logits = out
+                return logits.sigmoid()
+        except torch.cuda.OutOfMemoryError as e:
+            # Free the cache so the diagnostic free-memory number is accurate
+            # and a retry at smaller max_edge has a clean slate.
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info(self.device) if self.device.type == "cuda" else (0, 0)
+            raise torch.cuda.OutOfMemoryError(
+                f"OOM during forward at input {tuple(x.shape)}, dtype={x.dtype}, "
+                f"device={self.device}. After empty_cache(): "
+                f"{free/1e9:.2f} GB free / {total/1e9:.2f} GB total. "
+                f"Try lowering max_edge (current bucket = {tuple(x.shape[-2:])}), "
+                f"using dtype='bf16' on Ampere+, or splitting the input. "
+                f"Original: {e}"
+            ) from e
+
+    @torch.inference_mode()
+    def warmup(self, shapes: Optional[Sequence[Tuple[int, int]]] = None) -> None:
+        """Pre-compile / pre-allocate for known input shapes.
+
+        Drives one forward pass per (h, w) in `shapes` (defaults to the
+        explicit `buckets` if any). Useful before serving begins so the
+        first real request doesn't pay the torch.compile / cuDNN-autotune
+        / KV-allocation cost.
+
+        No-op if neither `shapes` nor `buckets` are provided.
+        """
+        targets = list(shapes or self.buckets or [])
+        for hw in targets:
+            h, w = int(hw[0]), int(hw[1])
+            x = torch.zeros(1, 3, h, w, device=self.device)
+            if self.normalize:
+                x = (x - self._mean) / self._std
+            if self.channels_last:
+                x = x.contiguous(memory_format=torch.channels_last)
+            if self.amp_dtype is not None and self.device.type == "cuda":
+                x = x.to(self.amp_dtype)
+            self._forward(x)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def __repr__(self) -> str:
+        bb_name = type(getattr(self.model, "bb", self.model)).__name__
+        n_params = sum(p.numel() for p in self.model.parameters())
+        amp = (
+            self.amp_dtype.__str__().rsplit(".", 1)[-1]
+            if self.amp_dtype is not None
+            else "fp32"
+        )
+        bucket_str = (
+            f", buckets={len(self.buckets)}"
+            if self.buckets is not None
+            else f", max_edge={self.max_edge}"
+        )
+        return (
+            f"BiRefNetPredictor(bb={bb_name}, params={n_params/1e6:.1f}M, "
+            f"device={self.device}, dtype={amp}, "
+            f"channels_last={self.channels_last}{bucket_str})"
+        )
 
     def _refine_foreground_np(self, rgb: np.ndarray, alpha: np.ndarray, r: int = 90) -> np.ndarray:
         """Photoroom-style two-pass blur fusion foreground estimation.
