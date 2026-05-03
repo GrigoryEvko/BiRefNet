@@ -217,15 +217,20 @@ class BiRefNetPredictor:
             x = x.to(self.amp_dtype)
 
         mask = self._forward(x)  # [1,1,h,w] in autocast dtype (bf16 or fp32)
+        # Upcast to fp32 BEFORE the upsample. The bf16 path saves time on the
+        # tiny pre-upsample tensor but the post-upsample tensor is large at HR
+        # (12K → 384MB fp32). Casting AFTER upsample meant bf16 mask + fp32
+        # mask co-existed transiently → 576MB peak vs 384MB old. Casting first
+        # keeps peak at the old level; the speed cost is on a small tensor.
+        mask = mask.float()
         mask = F.interpolate(
             mask, size=(orig_h, orig_w), mode="bicubic", align_corners=False, antialias=True
         ).clamp_(0.0, 1.0)
         mask = mask[0, 0]
         if return_pil:
-            arr = (mask.detach().float().cpu().numpy() * 255.0).round().astype(np.uint8)
+            arr = (mask.detach().cpu().numpy() * 255.0).round().astype(np.uint8)
             return Image.fromarray(arr, mode="L")
-        # Cast to fp32 at the user boundary — the docstring promises fp32 in [0,1].
-        return mask.float()
+        return mask
 
     @torch.inference_mode()
     def predict_batch(
@@ -290,11 +295,12 @@ class BiRefNetPredictor:
                 top : (m_h - bot_off) if bot_off else m_h,
                 left : (m_w - right_off) if right_off else m_w,
             ]
-            # Upsample in native (autocast) dtype, fp32 only at user boundary.
+            # Upcast to fp32 before the upsample so peak memory equals
+            # post-upsample fp32 only, not bf16 + fp32 simultaneously.
             m = F.interpolate(
-                m, size=(oh, ow), mode="bicubic", align_corners=False, antialias=True
+                m.float(), size=(oh, ow), mode="bicubic", align_corners=False, antialias=True
             ).clamp_(0.0, 1.0)
-            out.append(m[0, 0].float())
+            out.append(m[0, 0])
         return out
 
     @torch.inference_mode()
