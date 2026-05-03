@@ -14,8 +14,22 @@ from models.modules.aspp import ASPP, ASPPDeformable
 
 
 def image2patches(image, grid_h=2, grid_w=2, patch_ref=None, transformation='b c (hg h) (wg w) -> (b hg wg) c h w'):
+    """Split an image into a grid of patches via einops rearrange.
+
+    einops requires the spatial dims be divisible by grid_h × grid_w. When
+    the caller derives grid sizes from an internal feature shape, an HR
+    input (e.g. 1023×1024) can leave a non-zero remainder and crash the
+    rearrange. Pad bottom-right with replicate to the next multiple; the
+    downstream F.interpolate at the call site resamples to the correct
+    feature shape, so the pad doesn't bleed into the model output.
+    """
     if patch_ref is not None:
-        grid_h, grid_w = image.shape[-2] // patch_ref.shape[-2], image.shape[-1] // patch_ref.shape[-1]
+        grid_h = max(1, image.shape[-2] // patch_ref.shape[-2])
+        grid_w = max(1, image.shape[-1] // patch_ref.shape[-1])
+    pad_h = (-image.shape[-2]) % grid_h
+    pad_w = (-image.shape[-1]) % grid_w
+    if pad_h or pad_w:
+        image = F.pad(image, (0, pad_w, 0, pad_h), mode='replicate')
     patches = rearrange(image, transformation, hg=grid_h, wg=grid_w)
     return patches
 
