@@ -45,7 +45,11 @@ class Config():
 
         # Faster-Training settings
         self.precisionHigh = True
-        self.load_all = False and self.dynamic_size is None     # Turn it on/off by your case. It may consume a lot of CPU memory. And for multi-GPU (N), it would cost N times the CPU memory to load the data.
+        # Off by default: loading every sample into RAM costs N× memory under
+        # multi-GPU and only helps when the disk is the bottleneck. Flip the
+        # `enable` value to True to opt in for a fast machine with plenty of RAM.
+        enable_load_all = False
+        self.load_all = enable_load_all and self.dynamic_size is None
                                                                 #   Machines with > 70GB CPU memory can run the whole training on DIS5K with default setting.
                                                                 # 2. Higher PyTorch version may fix it: https://github.com/pytorch/pytorch/issues/119607.
                                                                 # 3. But compile in 2.0.1 < Pytorch < 2.5.0 seems to bring no acceleration for training.

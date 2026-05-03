@@ -1,12 +1,30 @@
 import os
+# Set CUDA allocator env vars BEFORE importing torch — once torch is imported the
+# CUDA caching allocator may have already been initialized on some platforms.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import datetime
-from contextlib import nullcontext
+import re
 import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-if tuple(map(int, torch.__version__.split('+')[0].split(".")[:3])) >= (2, 5, 0):
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
+def _torch_version_at_least(major: int, minor: int, patch: int = 0) -> bool:
+    """Tolerant version compare; works on stable, +cu131 suffixes, and
+    nightly stems like '2.11.0.dev20260101+cu131'."""
+    m = re.match(r'(\d+)\.(\d+)(?:\.(\d+))?', torch.__version__)
+    if not m:
+        return False
+    cur = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+    return cur >= (major, minor, patch)
+
+
+if not _torch_version_at_least(2, 5, 0):
+    # Below 2.5.0 didn't support expandable_segments; clear the env var so we
+    # don't poison the runtime with a value the allocator rejects.
+    os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
 
 from config import Config
 from loss import PixLoss, ClsLoss

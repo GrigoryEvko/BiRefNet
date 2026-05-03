@@ -116,9 +116,32 @@ def save_tensor_img(tenor_im, path):
     im.save(path)
 
 
-def set_seed(seed):
+def set_seed(seed, deterministic=False):
+    """Seed all RNGs.
+
+    `deterministic=True` opts into stricter determinism (slower; ~10-30% on
+    HR training):
+      - cudnn.deterministic=True + cudnn.benchmark=False
+      - torch.use_deterministic_algorithms(True, warn_only=True)
+      - CUBLAS_WORKSPACE_CONFIG=:4096:8 (required for cuBLAS determinism on
+        recent CUDA; setting after the first cuBLAS call is too late so we
+        also call os.environ.setdefault)
+    Off by default: cudnn picks the fastest algo and TF32 is enabled (HR-friendly).
+    """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
+    if deterministic:
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except (TypeError, AttributeError):
+            torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True

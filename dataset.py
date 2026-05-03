@@ -33,6 +33,20 @@ _class_labels_TR_sorted = (
 class_labels_TR_sorted = _class_labels_TR_sorted.split(', ')
 
 
+def _class_id_from_path(cls_name2id: dict, label_path: str) -> int:
+    """Extract the class id from a DIS5K-style filename `XXX#cat#XX#ClassName#YY.png`.
+
+    Returns -1 (i.e. 'unknown class') when the filename doesn't have the
+    expected structure, instead of crashing the DataLoader worker with
+    IndexError. The previous code did `name.split('#')[3]` blindly.
+    """
+    name = os.path.basename(label_path)
+    tokens = name.split('#')
+    if len(tokens) <= 3:
+        return -1
+    return cls_name2id.get(tokens[3], -1)
+
+
 class MyData(data.Dataset):
     def __init__(self, datasets, data_size, is_train=True):
         # data_size is None when using dynamic_size or data_size is manually set to None (for inference in the original size).
@@ -101,7 +115,7 @@ class MyData(data.Dataset):
                 self.images_loaded.append(_image)
                 self.labels_loaded.append(_label)
                 self.class_labels_loaded.append(
-                    self.cls_name2id[label_path.split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
+                    _class_id_from_path(self.cls_name2id, label_path) if self.is_train and config.auxiliary_classification else -1
                 )
 
     def __getitem__(self, index):
@@ -112,7 +126,7 @@ class MyData(data.Dataset):
         else:
             image = path_to_image(self.image_paths[index], size=self.data_size, color_type='rgb')
             label = path_to_image(self.label_paths[index], size=self.data_size, color_type='gray')
-            class_label = self.cls_name2id[self.label_paths[index].split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
+            class_label = _class_id_from_path(self.cls_name2id, self.label_paths[index]) if self.is_train and config.auxiliary_classification else -1
 
         # loading image and label
         if self.is_train:
@@ -121,25 +135,37 @@ class MyData(data.Dataset):
                 array_image = np.array(image)
                 array_foreground = array_image[:, :, :3].astype(np.float32)
                 array_mask = (array_image[:, :, 3:] / 255).astype(np.float32)
-                array_background = np.zeros_like(array_foreground)
-                choice = random.random()
-                if choice < 0.4:
-                    # Black/Gray/White backgrounds
-                    array_background[:, :, :] = random.randint(0, 255)
-                elif choice < 0.8:
-                    # Background color that similar to the foreground object. Hard negative samples.
-                    foreground_pixel_number = np.sum(array_mask > 0)
-                    color_foreground_mean = np.mean(array_foreground * array_mask, axis=(0, 1)) * (np.prod(array_foreground.shape[:2]) / foreground_pixel_number)
-                    color_up_or_down = random.choice((-1, 1))
-                    # Up or down for 20% range from 255 or 0, respectively.
-                    color_foreground_mean += (255 - color_foreground_mean if color_up_or_down == 1 else color_foreground_mean) * (random.random() * 0.2) * color_up_or_down
-                    array_background[:, :, :] = color_foreground_mean
-                else:
-                    # Any color
-                    for idx_channel in range(3):
-                        array_background[:, :, idx_channel] = random.randint(0, 255)
-                array_foreground_background = array_foreground * array_mask + array_background * (1 - array_mask)
-                image = Image.fromarray(array_foreground_background.astype(np.uint8))
+                # Skip synthesis for empty masks: the foreground-mean branch
+                # would divide by zero and inject NaNs into the background, then
+                # uint8-cast → undefined behavior, then NaN gradients.
+                mask_total = float(array_mask.sum())
+                if mask_total > 1e-6:
+                    array_background = np.zeros_like(array_foreground)
+                    choice = random.random()
+                    if choice < 0.4:
+                        # Black/gray/white background
+                        array_background[:, :, :] = random.randint(0, 255)
+                    elif choice < 0.8:
+                        # Hard-negative background: color similar to the foreground.
+                        # Use a true alpha-weighted mean; the previous formula
+                        # `mean(fg*mask) * (total / fpn)` was only correct for
+                        # binary masks, and `fpn = sum(mask>0)` lost weight info
+                        # for soft alpha (mask in [0,1]).
+                        weighted_sum = (array_foreground * array_mask).sum(axis=(0, 1))
+                        color_foreground_mean = weighted_sum / mask_total  # shape (3,)
+                        color_up_or_down = random.choice((-1, 1))
+                        # Push 0..20% toward 255 (up) or 0 (down)
+                        if color_up_or_down == 1:
+                            color_foreground_mean = color_foreground_mean + (255 - color_foreground_mean) * (random.random() * 0.2)
+                        else:
+                            color_foreground_mean = color_foreground_mean - color_foreground_mean * (random.random() * 0.2)
+                        array_background[:, :, :] = color_foreground_mean
+                    else:
+                        # Any color
+                        for idx_channel in range(3):
+                            array_background[:, :, idx_channel] = random.randint(0, 255)
+                    array_foreground_background = array_foreground * array_mask + array_background * (1 - array_mask)
+                    image = Image.fromarray(np.clip(array_foreground_background, 0, 255).astype(np.uint8))
             image, label = preproc(image, label, preproc_methods=config.preproc_methods)
         # else:
         #     if _label.shape[0] > 2048 or _label.shape[1] > 2048:
@@ -179,13 +205,9 @@ def _sample_dynamic_size():
     # crossed. Removed.
     w_lo, w_hi = config.dynamic_size[0]
     h_lo, h_hi = config.dynamic_size[1]
-    try:
-        import torch.distributed as dist
-        is_dist = dist.is_available() and dist.is_initialized()
-    except ImportError:
-        is_dist = False
-
-    if is_dist and dist.get_world_size() > 1:
+    import torch.distributed as dist
+    is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    if is_dist:
         if dist.get_rank() == 0:
             w = random.randint(w_lo, w_hi) // 32 * 32
             h = random.randint(h_lo, h_hi) // 32 * 32
