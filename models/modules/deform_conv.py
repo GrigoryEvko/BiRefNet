@@ -48,19 +48,27 @@ class DeformableConv2d(nn.Module):
                                       bias=bias)
 
     def forward(self, x):
-        #h, w = x.shape[2:]
-        #max_offset = max(h, w)/4.
-
-        offset = self.offset_conv(x)#.clamp(-max_offset, max_offset)
+        offset = self.offset_conv(x)
         modulator = 2. * torch.sigmoid(self.modulator_conv(x))
-        
-        x = deform_conv2d(
-            input=x,
-            offset=offset,
-            weight=self.regular_conv.weight,
-            bias=self.regular_conv.bias,
-            padding=self.padding,
-            mask=modulator,
-            stride=self.stride,
+
+        # torchvision.ops.deform_conv2d does not implement a bf16 CUDA kernel;
+        # it raises NotImplementedError under autocast(bfloat16). Cast to fp32
+        # for the op and back so the module is usable inside bf16 autocast.
+        in_dtype = x.dtype
+        if in_dtype == torch.bfloat16:
+            x_f = x.float()
+            offset_f = offset.float()
+            modulator_f = modulator.float()
+            weight_f = self.regular_conv.weight.float()
+            bias_f = self.regular_conv.bias.float() if self.regular_conv.bias is not None else None
+            out = deform_conv2d(
+                input=x_f, offset=offset_f, weight=weight_f, bias=bias_f,
+                padding=self.padding, mask=modulator_f, stride=self.stride,
+            )
+            return out.to(in_dtype)
+
+        return deform_conv2d(
+            input=x, offset=offset,
+            weight=self.regular_conv.weight, bias=self.regular_conv.bias,
+            padding=self.padding, mask=modulator, stride=self.stride,
         )
-        return x
