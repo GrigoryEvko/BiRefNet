@@ -147,15 +147,15 @@ def _pil_to_rgb_tensor(img: Image.Image, device: torch.device) -> torch.Tensor:
     if img.mode != "RGB":
         img = img.convert("RGB")
     # PIL's __array_interface__ returns a read-only view; torch.from_numpy
-    # warns on read-only arrays. np.array(...) forces ONE CPU copy (vs the
-    # old code's TWO: explicit copy=True + .contiguous() after permute).
-    # The .to(device) below transfers to GPU; permute+contiguous on GPU
-    # is a single GPU-side copy. Total: 1 CPU copy + 1 GPU copy. At 12K
-    # we save 432MB vs the old flow.
+    # warns on read-only arrays. np.array(...) forces ONE CPU copy.
     arr = np.array(img, dtype=np.uint8)
-    t = torch.from_numpy(arr).to(device, non_blocking=True)        # HWC uint8 GPU
-    t = t.permute(2, 0, 1).contiguous()                             # CHW uint8 GPU
-    return t.to(torch.float32).div_(255.0)                          # CHW fp32 GPU
+    t = torch.from_numpy(arr).to(device, non_blocking=True)         # HWC uint8 GPU
+    t = t.permute(2, 0, 1)                                          # CHW uint8 (non-contig view)
+    # .to(float32) on a non-contig view produces a contiguous fp32 output
+    # in a SINGLE memory pass (gather + cast). The previous explicit
+    # .contiguous() before .to() did two passes (one to materialize uint8
+    # contig, one to cast to fp32). At 12K HR: ~290MB GPU bandwidth saved.
+    return t.to(torch.float32).div_(255.0)                          # CHW fp32 GPU contiguous
 
 
 class BiRefNetPredictor:
@@ -460,7 +460,10 @@ class BiRefNetPredictor:
         # unnecessary round-trip costing ~2× the mask size at HR.
         if refine_fg:
             rgb_np = self._refine_foreground_np(rgb_np, mask_t, r=fg_radius)
-        alpha_np = (mask_t.cpu().numpy() * 255.0).round().astype(np.uint8)
+        # Quantize to uint8 on the GPU before transferring — the full-res
+        # fp32 mask is 4 bytes/pixel; uint8 is 1. At 12K that's 96MB vs
+        # 384MB across PCIe, ~11ms saved per cutout on a typical bus.
+        alpha_np = mask_t.mul(255).round_().clamp_(0, 255).to(torch.uint8).cpu().numpy()
         rgba = np.dstack([rgb_np, alpha_np])
         return Image.fromarray(rgba, mode="RGBA")
 
