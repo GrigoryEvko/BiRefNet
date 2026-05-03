@@ -175,7 +175,11 @@ class PixLoss(nn.Module):
                     inp = pred_sig
                 _loss = criterion(inp, gt) * self.lambdas_pix_last[criterion_name] * pix_loss_lambda
                 loss += _loss
-                loss_dict[criterion_name] = loss_dict.get(criterion_name, 0.) + _loss.item() / len(scaled_preds)
+                # Log the same value that's backpropped — sum across scales,
+                # not the per-scale mean. The previous /len(scaled_preds)
+                # silently undercounted by N and made the dict disagree with
+                # the actual loss tensor.
+                loss_dict[criterion_name] = loss_dict.get(criterion_name, 0.) + _loss.item()
         return loss, loss_dict
 
 

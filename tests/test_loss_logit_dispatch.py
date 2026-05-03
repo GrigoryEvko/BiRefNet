@@ -85,6 +85,21 @@ def test_structure_loss_receives_logits_not_sigmoid():
         type(pix.criterions_last["structure"]).forward = real_forward
 
 
+def test_loss_dict_matches_summed_loss():
+    """loss_dict[name] must equal the sum of per-scale contributions of that
+    criterion — not the per-scale mean. The previous /len(scaled_preds)
+    division silently undercounted the dict by N (num scales).
+    """
+    pix = _fresh_pixloss()
+    preds = [torch.randn(1, 1, 16, 16) for _ in range(3)]
+    gt = torch.rand(1, 1, 16, 16)
+    loss, ld = pix(preds, gt)
+    # Sum of dict entries should match the loss tensor.
+    assert abs(sum(ld.values()) - loss.item()) < 1e-3, (
+        f"loss_dict sum ({sum(ld.values())}) != loss ({loss.item()})"
+    )
+
+
 def test_iou_still_receives_sigmoid_inputs():
     """Counterpart: non-logit criteria must still get sigmoid'd preds (their
     formulas assume probabilities in [0,1])."""
