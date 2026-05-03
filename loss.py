@@ -44,17 +44,17 @@ class IoULoss(torch.nn.Module):
         super(IoULoss, self).__init__()
 
     def forward(self, pred, target):
-        b = pred.shape[0]
-        IoU = 0.0
-        for i in range(0, b):
-            # compute the IoU of the foreground
-            Iand1 = torch.sum(target[i, :, :, :] * pred[i, :, :, :])
-            Ior1 = torch.sum(target[i, :, :, :]) + torch.sum(pred[i, :, :, :]) - Iand1
-            IoU1 = Iand1 / Ior1
-            # IoU loss is (1-IoU1)
-            IoU = IoU + (1-IoU1)
-        # return IoU/b
-        return IoU
+        # Per-batch foreground IoU summed across the batch (the original loop
+        # behaviour). Vectorized: sum over (C, H, W) per batch entry, then
+        # reduce. Avoids the Python-level loop and produces the same scalar.
+        dims = tuple(range(1, pred.ndim))
+        inter = (pred * target).sum(dim=dims)
+        union = pred.sum(dim=dims) + target.sum(dim=dims) - inter
+        # Match upstream: divide-by-zero (empty mask + empty pred) returns NaN
+        # which is what the original loop also produced. Tests for production
+        # cases never hit this case.
+        iou = inter / union
+        return (1 - iou).sum()
 
 
 class StructureLoss(torch.nn.Module):
