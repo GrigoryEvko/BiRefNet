@@ -88,8 +88,13 @@ def _load_pil(image: ImageInput, max_pixels: Optional[int] = None) -> Image.Imag
         return image
     if isinstance(image, np.ndarray):
         arr = image
-        if arr.ndim >= 2:
-            _check_pixel_budget(arr.shape[0], arr.shape[1], max_pixels)
+        if arr.ndim not in (2, 3):
+            raise ValueError(
+                f"unsupported numpy ndim={arr.ndim}, shape={arr.shape}; "
+                f"expected (H, W) or (H, W, C). Pass a torch.Tensor for "
+                f"batched/channels-first inputs."
+            )
+        _check_pixel_budget(arr.shape[0], arr.shape[1], max_pixels)
         if arr.ndim == 2:
             arr = _np_to_uint8(arr)
             return Image.fromarray(arr, mode="L").convert("RGB")
@@ -141,9 +146,16 @@ def _load_pil(image: ImageInput, max_pixels: Optional[int] = None) -> Image.Imag
 def _pil_to_rgb_tensor(img: Image.Image, device: torch.device) -> torch.Tensor:
     if img.mode != "RGB":
         img = img.convert("RGB")
-    arr = np.array(img, dtype=np.uint8, copy=True)
-    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(device, non_blocking=True)
-    return t.float().div_(255.0)
+    # PIL's __array_interface__ returns a read-only view; torch.from_numpy
+    # warns on read-only arrays. np.array(...) forces ONE CPU copy (vs the
+    # old code's TWO: explicit copy=True + .contiguous() after permute).
+    # The .to(device) below transfers to GPU; permute+contiguous on GPU
+    # is a single GPU-side copy. Total: 1 CPU copy + 1 GPU copy. At 12K
+    # we save 432MB vs the old flow.
+    arr = np.array(img, dtype=np.uint8)
+    t = torch.from_numpy(arr).to(device, non_blocking=True)        # HWC uint8 GPU
+    t = t.permute(2, 0, 1).contiguous()                             # CHW uint8 GPU
+    return t.to(torch.float32).div_(255.0)                          # CHW fp32 GPU
 
 
 class BiRefNetPredictor:
@@ -311,10 +323,16 @@ class BiRefNetPredictor:
         orig_w, orig_h = pil.size  # PIL is (w, h)
         bucket_hw = self._pick_bucket((orig_h, orig_w), max_edge)
 
-        bucket_pil = pil if pil.size == (bucket_hw[1], bucket_hw[0]) else pil.resize(
-            (bucket_hw[1], bucket_hw[0]), _LANCZOS
-        )
+        # Letterbox into the bucket so explicit-bucket users (constructor
+        # buckets=...) don't get aspect-distorted masks. With aspect_bucket
+        # this is effectively a no-op (rh, rw == bucket_hw). With nearest
+        # bucket selection from a small fixed set, it's the difference
+        # between a faithful prediction and a squashed one.
+        (rh, rw), (pt, pb, pl, pr) = fit_into_bucket((orig_h, orig_w), bucket_hw)
+        bucket_pil = pil if pil.size == (rw, rh) else pil.resize((rw, rh), _LANCZOS)
         x = _pil_to_rgb_tensor(bucket_pil, self.device).unsqueeze(0)
+        if (pt, pb, pl, pr) != (0, 0, 0, 0):
+            x = F.pad(x, (pl, pr, pt, pb), mode="replicate")
         if self.normalize:
             x = (x - self._mean) / self._std
         if self.channels_last:
@@ -322,13 +340,18 @@ class BiRefNetPredictor:
         if self.amp_dtype is not None and self.device.type == "cuda":
             x = x.to(self.amp_dtype)
 
-        mask = self._forward(x)  # [1,1,h,w] in autocast dtype (bf16 or fp32)
-        # Upcast to fp32 BEFORE the upsample. The bf16 path saves time on the
-        # tiny pre-upsample tensor but the post-upsample tensor is large at HR
-        # (12K → 384MB fp32). Casting AFTER upsample meant bf16 mask + fp32
-        # mask co-existed transiently → 576MB peak vs 384MB old. Casting first
-        # keeps peak at the old level; the speed cost is on a small tensor.
-        mask = mask.float()
+        mask = self._forward(x)  # [1,1,h,w] fp32 (sigmoid is now in fp32 in _forward)
+        # Crop the letterbox padding from the mask before upsample.
+        bh, bw = bucket_hw
+        m_h, m_w = mask.shape[-2], mask.shape[-1]
+        if (pt, pb, pl, pr) != (0, 0, 0, 0):
+            top = max(0, int(round(pt * m_h / bh)))
+            bot_off = max(0, int(round(pb * m_h / bh)))
+            left = max(0, int(round(pl * m_w / bw)))
+            right_off = max(0, int(round(pr * m_w / bw)))
+            end_h = max(top + 1, m_h - bot_off)
+            end_w = max(left + 1, m_w - right_off)
+            mask = mask[..., top:end_h, left:end_w]
         mask = F.interpolate(
             mask, size=(orig_h, orig_w), mode="bicubic", align_corners=False, antialias=True
         ).clamp_(0.0, 1.0)
@@ -367,7 +390,10 @@ class BiRefNetPredictor:
         pads = []
         for pil, (oh, ow) in items:
             (rh, rw), (pt, pb, pl, pr) = fit_into_bucket((oh, ow), bucket_hw)
-            resized = pil.resize((rw, rh), _LANCZOS)
+            # Skip the LANCZOS pass when the image already matches the
+            # bucket — saves ~50ms per 4K image when callers send
+            # bucket-sized inputs.
+            resized = pil if pil.size == (rw, rh) else pil.resize((rw, rh), _LANCZOS)
             t = _pil_to_rgb_tensor(resized, self.device)
             if (pt, pb, pl, pr) != (0, 0, 0, 0):
                 # F.pad takes (left, right, top, bottom)
@@ -375,6 +401,10 @@ class BiRefNetPredictor:
             tensors.append(t)
             pads.append((pt, pb, pl, pr, rh, rw))
         x = torch.stack(tensors, dim=0)
+        # The per-item tensors are no longer needed — drop the strong refs
+        # so they can be GC'd while the model forward runs (saves B × C × H ×
+        # W × 4 bytes of peak VRAM at HR batch).
+        del tensors
         if self.normalize:
             x = (x - self._mean) / self._std
         if self.channels_last:
@@ -392,19 +422,20 @@ class BiRefNetPredictor:
         m_h, m_w = masks.shape[-2], masks.shape[-1]
         for i, (_, (oh, ow)) in enumerate(items):
             pt, pb, pl, pr, _rh, _rw = pads[i]
-            top = int(round(pt * m_h / bh))
-            bot_off = int(round(pb * m_h / bh))
-            left = int(round(pl * m_w / bw))
-            right_off = int(round(pr * m_w / bw))
-            m = masks[
-                i : i + 1, :,
-                top : (m_h - bot_off) if bot_off else m_h,
-                left : (m_w - right_off) if right_off else m_w,
-            ]
-            # Upcast to fp32 before the upsample so peak memory equals
-            # post-upsample fp32 only, not bf16 + fp32 simultaneously.
+            # Clamp + max(start+1, end) so a future model that returns a
+            # different m_h vs bh (e.g. some torch.compile rounding) can't
+            # produce an empty or backwards slice that would crash
+            # F.interpolate.
+            top = max(0, int(round(pt * m_h / bh)))
+            bot_off = max(0, int(round(pb * m_h / bh)))
+            left = max(0, int(round(pl * m_w / bw)))
+            right_off = max(0, int(round(pr * m_w / bw)))
+            end_h = max(top + 1, m_h - bot_off)
+            end_w = max(left + 1, m_w - right_off)
+            m = masks[i : i + 1, :, top:end_h, left:end_w]
+            # Sigmoid is now in fp32 in _forward, so m is already fp32.
             m = F.interpolate(
-                m.float(), size=(oh, ow), mode="bicubic", align_corners=False, antialias=True
+                m, size=(oh, ow), mode="bicubic", align_corners=False, antialias=True
             ).clamp_(0.0, 1.0)
             out.append(m[0, 0])
         return out
@@ -424,9 +455,12 @@ class BiRefNetPredictor:
         rgb_pil = pil.convert("RGB")
         mask_t = cast("torch.Tensor", self.predict(rgb_pil, max_edge=max_edge, return_pil=False))
         rgb_np = np.asarray(rgb_pil, dtype=np.uint8)
-        alpha_np = (mask_t.float().cpu().numpy() * 255.0).round().astype(np.uint8)
+        # Refine reads the GPU mask tensor directly — the previous flow
+        # CPU-quantized alpha to uint8 then re-uploaded it as fp32, an
+        # unnecessary round-trip costing ~2× the mask size at HR.
         if refine_fg:
-            rgb_np = self._refine_foreground_np(rgb_np, alpha_np, r=fg_radius)
+            rgb_np = self._refine_foreground_np(rgb_np, mask_t, r=fg_radius)
+        alpha_np = (mask_t.cpu().numpy() * 255.0).round().astype(np.uint8)
         rgba = np.dstack([rgb_np, alpha_np])
         return Image.fromarray(rgba, mode="RGBA")
 
@@ -477,12 +511,27 @@ class BiRefNetPredictor:
         if self.buckets:
             from collections import Counter
             picks = [nearest_bucket(hw, self.buckets) for hw in items_hw]
-            return Counter(picks).most_common(1)[0][0]
+            counts = Counter(picks)
+            # Deterministic tiebreak: most-common, then smallest area, then
+            # tuple ordering. Without this, Counter.most_common(1) returns
+            # whichever insertion order the iteration produced — different
+            # request ordering produces different bucket choice → torch.compile
+            # cache thrash in production.
+            return max(counts, key=lambda b: (counts[b], -b[0] * b[1], b))
         per_item = [aspect_bucket(hw, max_edge=max_edge, multiple=self.multiple) for hw in items_hw]
-        # Take the per-axis max so every image can be letterbox'd into it
-        # without upscaling. (Aspect distortion is avoided by the letterbox.)
+        # Per-axis max ensures every image can be letterbox'd in without
+        # upscaling. But max-h from item A and max-w from item B can stack
+        # into a square that's larger than max_edge × max_edge. Cap the long
+        # axis so we don't accidentally allocate a 4MP square for a batch of
+        # rectangles.
         bh = max(b[0] for b in per_item)
         bw = max(b[1] for b in per_item)
+        long_axis = max(bh, bw)
+        if long_axis > max_edge:
+            scale = max_edge / long_axis
+            m = self.multiple
+            bh = max(m, ((int(bh * scale) + m // 2) // m) * m)
+            bw = max(m, ((int(bw * scale) + m // 2) // m) * m)
         return (bh, bw)
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -498,16 +547,29 @@ class BiRefNetPredictor:
                     logits = out[-1]
                 else:
                     logits = out
-                return logits.sigmoid()
+            # Sigmoid in fp32 (matches inference.py): bf16 sigmoid quantizes
+            # values near 1.0 into ~5 bins (7-bit mantissa), losing useful
+            # mask precision. The upcast cost is on a small pre-upsample
+            # tensor — negligible vs preserving 23-bit precision.
+            return logits.float().sigmoid()
         except torch.cuda.OutOfMemoryError as e:
-            # Free the cache so the diagnostic free-memory number is accurate
-            # and a retry at smaller max_edge has a clean slate.
-            torch.cuda.empty_cache()
-            free, total = torch.cuda.mem_get_info(self.device) if self.device.type == "cuda" else (0, 0)
+            # Be defensive: empty_cache() / mem_get_info() can themselves
+            # raise on a corrupted CUDA context (the rotation pattern your
+            # k8s deploy uses every 24h is precisely to mitigate this).
+            # Always preserve the original OOM as the cause.
+            free = total = None
+            try:
+                torch.cuda.empty_cache()
+                if self.device.type == "cuda":
+                    free, total = torch.cuda.mem_get_info(self.device)
+            except Exception:
+                pass
+            free_str = f"{free/1e9:.2f} GB" if free is not None else "unknown"
+            total_str = f"{total/1e9:.2f} GB" if total is not None else "unknown"
             raise torch.cuda.OutOfMemoryError(
                 f"OOM during forward at input {tuple(x.shape)}, dtype={x.dtype}, "
                 f"device={self.device}. After empty_cache(): "
-                f"{free/1e9:.2f} GB free / {total/1e9:.2f} GB total. "
+                f"{free_str} free / {total_str} total. "
                 f"Try lowering max_edge (current bucket = {tuple(x.shape[-2:])}), "
                 f"using dtype='bf16' on Ampere+, or splitting the input. "
                 f"Original: {e}"
@@ -557,24 +619,48 @@ class BiRefNetPredictor:
             f"channels_last={self.channels_last}{bucket_str})"
         )
 
-    def _refine_foreground_np(self, rgb: np.ndarray, alpha: np.ndarray, r: int = 90) -> np.ndarray:
+    def _refine_foreground_np(self, rgb: np.ndarray, alpha, r: int = 90) -> np.ndarray:
         """Photoroom-style two-pass blur fusion foreground estimation.
 
-        Inputs are uint8 HWC and HW respectively. Output is uint8 HWC at the
-        same resolution. Picks GPU vs CPU automatically based on free VRAM —
-        the GPU path otherwise OOMs on multi-megapixel inputs (a 12K image
-        needs ~5 GB transient float buffers).
+        Inputs:
+          - rgb: uint8 HWC numpy
+          - alpha: either uint8 HW numpy OR a torch.Tensor in [0, 1]
+            (HW or 1×1×H×W or H×W shape). Passing a tensor lets cutout()
+            skip a CPU round-trip of the mask.
+
+        Output: uint8 HWC numpy at the same resolution. Picks GPU vs CPU
+        automatically based on free VRAM.
         """
-        h, w = alpha.shape
+        if isinstance(alpha, torch.Tensor):
+            # Mask was passed directly from predict() — already on the right
+            # device, already fp32 in [0,1]. Use shape from the tensor.
+            alpha_squeezed = alpha.squeeze() if alpha.ndim > 2 else alpha
+            h, w = alpha_squeezed.shape[-2], alpha_squeezed.shape[-1]
+        else:
+            h, w = alpha.shape
         r = max(1, min(int(r), max(1, min(h, w) - 1)))
-        # ~7 fp32 buffers of (h, w, 3) survive simultaneously through the
-        # two _fb_blur_pass calls. Be conservative.
-        est_bytes = h * w * 3 * 4 * 8
+        # Two avg_pool2d separable passes × ~6 transient buffers each.
+        # Bumped to 12 from 8 — at 12K input the previous 8x estimate
+        # under-counted and led to GPU OOM on smaller GPUs.
+        est_bytes = h * w * 3 * 4 * 12
         device = self._pick_refine_device(est_bytes)
-        rgb_arr = np.array(rgb, copy=True)
-        alpha_arr = np.array(alpha, copy=True)
-        rgb_t = torch.from_numpy(rgb_arr).to(device).float().div_(255.0).permute(2, 0, 1).unsqueeze(0)
-        alpha_t = torch.from_numpy(alpha_arr).to(device).float().div_(255.0).unsqueeze(0).unsqueeze(0)
+        # Drop redundant np.array(copy=True) — caller already owns these
+        # buffers, the torch.from_numpy view + .to(device) does the actual
+        # copy onto the target device. At 12K: saves ~432MB CPU + 144MB.
+        # PIL's array interface returns read-only buffers; torch.from_numpy
+        # warns on those. .copy() forces a writable buffer; on already-writable
+        # input we still pay one copy, but that's better than the silent
+        # undefined-behavior path the warning calls out.
+        if not rgb.flags.writeable:
+            rgb = rgb.copy()
+        rgb_t = torch.from_numpy(rgb).to(device).float().div_(255.0).permute(2, 0, 1).unsqueeze(0)
+        if isinstance(alpha, torch.Tensor):
+            # Already a GPU fp32 mask; just shape it to (1, 1, H, W).
+            alpha_t = alpha.to(device).float()
+            while alpha_t.ndim < 4:
+                alpha_t = alpha_t.unsqueeze(0)
+        else:
+            alpha_t = torch.from_numpy(alpha).to(device).float().div_(255.0).unsqueeze(0).unsqueeze(0)
         fg, blur_b = _fb_blur_pass(rgb_t, rgb_t, rgb_t, alpha_t, r)
         fg, _ = _fb_blur_pass(rgb_t, fg, blur_b, alpha_t, max(1, min(6, r)))
         out = fg.clamp_(0.0, 1.0).mul_(255.0).round_().byte()
