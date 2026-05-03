@@ -145,14 +145,24 @@ def test_predictor_disables_grad_on_load():
 
 
 def test_predictor_does_not_import_config():
-    """Sanity check: importing the predictor must not import the project's Config().
-
-    Config() reads train.sh and probes paths under SYS_HOME_DIR — it must stay
-    out of the inference hot path.
+    """Sanity check: importing birefnet_api in a fresh subprocess must not
+    transitively import the project's Config() (which reads train.sh and
+    probes paths under SYS_HOME_DIR).
     """
-    import sys
-    # the test_buckets / api imports should not have transitively pulled in `config`
-    assert "config" not in sys.modules or "Config" not in dir(sys.modules.get("config", object()))
+    import subprocess
+    import textwrap
+    repo = pathlib_root = __import__("pathlib").Path(__file__).resolve().parents[1]
+    code = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(repo)!r})
+        import birefnet_api  # noqa: F401
+        # config must NOT have been transitively imported
+        assert "config" not in sys.modules, sorted(sys.modules.keys())
+    """)
+    res = subprocess.run(
+        ["python3", "-c", code], capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
 
 
 def test_predict_handles_grayscale_input(cpu_predictor):
