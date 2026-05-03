@@ -166,11 +166,44 @@ class MyData(data.Dataset):
         return len(self.image_paths)
 
 
+def _sample_dynamic_size():
+    """Sample a (W, H) batch size from config.dynamic_size, snapped to /32.
+
+    Under DDP each rank's DataLoader workers sit in different processes; if
+    they each call random.randint independently the collate sizes diverge,
+    NCCL all-reduce shape-mismatches, and training hangs or crashes. Rank 0
+    picks the size and broadcasts to the rest.
+    """
+    # Note: previously this dict was wrapped in `tuple(sorted(...))` which
+    # lexicographically swapped the W and H ranges when their lower bounds
+    # crossed. Removed.
+    w_lo, w_hi = config.dynamic_size[0]
+    h_lo, h_hi = config.dynamic_size[1]
+    try:
+        import torch.distributed as dist
+        is_dist = dist.is_available() and dist.is_initialized()
+    except ImportError:
+        is_dist = False
+
+    if is_dist and dist.get_world_size() > 1:
+        if dist.get_rank() == 0:
+            w = random.randint(w_lo, w_hi) // 32 * 32
+            h = random.randint(h_lo, h_hi) // 32 * 32
+        else:
+            w, h = 0, 0
+        import torch
+        size_tensor = torch.tensor([w, h], dtype=torch.int64)
+        dist.broadcast(size_tensor, src=0)
+        w, h = int(size_tensor[0].item()), int(size_tensor[1].item())
+    else:
+        w = random.randint(w_lo, w_hi) // 32 * 32
+        h = random.randint(h_lo, h_hi) // 32 * 32
+    return (w, h)
+
+
 def custom_collate_fn(batch):
     if config.dynamic_size:
-        dynamic_size = tuple(sorted(config.dynamic_size))
-        dynamic_size_batch = (random.randint(dynamic_size[0][0], dynamic_size[0][1]) // 32 * 32, random.randint(dynamic_size[1][0], dynamic_size[1][1]) // 32 * 32) # select a value randomly in the range of [dynamic_size[0/1][0], dynamic_size[0/1][1]].
-        data_size = dynamic_size_batch
+        data_size = _sample_dynamic_size()
     else:
         data_size = config.size
     new_batch = []
