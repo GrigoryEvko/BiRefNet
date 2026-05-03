@@ -15,14 +15,20 @@ class ContourLoss(torch.nn.Module):
         target, pred: tensor of shape (B, C, H, W), where target[:,:,region_in_contour] == 1,
                         target[:,:,region_out_contour] == 0.
         weight: scalar, length term weight.
+
+        Runs in fp32 even under autocast: the sqrt(delta_pred + 1e-8) is numerically
+        fragile in bf16 (1e-8 underflows to 0 in the bf16 mantissa, sqrt(0).backward
+        emits +inf). Upcasting before the gradient ops keeps gradients finite.
         '''
+        pred = pred.float()
+        target = target.float()
         # length term
-        delta_r = pred[:,:,1:,:] - pred[:,:,:-1,:] # horizontal gradient (B, C, H-1, W) 
+        delta_r = pred[:,:,1:,:] - pred[:,:,:-1,:] # horizontal gradient (B, C, H-1, W)
         delta_c = pred[:,:,:,1:] - pred[:,:,:,:-1] # vertical gradient   (B, C, H,   W-1)
 
         delta_r    = delta_r[:,:,1:,:-2]**2  # (B, C, H-2, W-2)
         delta_c    = delta_c[:,:,:-2,1:]**2  # (B, C, H-2, W-2)
-        delta_pred = torch.abs(delta_r + delta_c) 
+        delta_pred = torch.abs(delta_r + delta_c)
 
         epsilon = 1e-8 # where is a parameter to avoid square root is zero in practice.
         length = torch.mean(torch.sqrt(delta_pred + epsilon)) # eq.(11) in the paper, mean is used instead of sum.
@@ -31,7 +37,7 @@ class ContourLoss(torch.nn.Module):
         c_out = torch.zeros_like(pred)
 
         region_in  = torch.mean( pred     * (target - c_in )**2 ) # equ.(12) in the paper, mean is used instead of sum.
-        region_out = torch.mean( (1-pred) * (target - c_out)**2 ) 
+        region_out = torch.mean( (1-pred) * (target - c_out)**2 )
         region = region_in + region_out
 
         loss =  weight * length + region
