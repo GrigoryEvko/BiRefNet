@@ -290,7 +290,16 @@ class SwinTransformerBlock(nn.Module):
             if config.SDPA_enabled:
                 B = x.size(0)
                 nW, N = mask_matrix.size(0), mask_matrix.size(1)
-                attn_mask = mask_matrix.unsqueeze(0).expand(B, nW, N, N).reshape(B * nW, N, N)
+                # B=1 is the dominant inference case (predict-one-image) — the
+                # mask is already (nW, N, N) which equals (B*nW, N, N) when
+                # B=1, so skip the expand+reshape. expand returns a view but
+                # reshape after expand on a stride-0 dim materializes the
+                # full (B*nW, N, N) tensor; at HR Swin × 24 blocks that's
+                # tens of MB transient per forward avoided in serving.
+                if B == 1:
+                    attn_mask = mask_matrix
+                else:
+                    attn_mask = mask_matrix.unsqueeze(0).expand(B, nW, N, N).reshape(B * nW, N, N)
             else:
                 attn_mask = mask_matrix
         else:
