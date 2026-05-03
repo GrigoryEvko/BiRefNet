@@ -216,7 +216,7 @@ class BiRefNetPredictor:
         if self.amp_dtype is not None and self.device.type == "cuda":
             x = x.to(self.amp_dtype)
 
-        mask = self._forward(x)  # [1,1,h,w] float32 in [0,1]
+        mask = self._forward(x)  # [1,1,h,w] in autocast dtype (bf16 or fp32)
         mask = F.interpolate(
             mask, size=(orig_h, orig_w), mode="bicubic", align_corners=False, antialias=True
         ).clamp_(0.0, 1.0)
@@ -224,7 +224,8 @@ class BiRefNetPredictor:
         if return_pil:
             arr = (mask.detach().float().cpu().numpy() * 255.0).round().astype(np.uint8)
             return Image.fromarray(arr, mode="L")
-        return mask
+        # Cast to fp32 at the user boundary — the docstring promises fp32 in [0,1].
+        return mask.float()
 
     @torch.inference_mode()
     def predict_batch(
@@ -289,10 +290,11 @@ class BiRefNetPredictor:
                 top : (m_h - bot_off) if bot_off else m_h,
                 left : (m_w - right_off) if right_off else m_w,
             ]
+            # Upsample in native (autocast) dtype, fp32 only at user boundary.
             m = F.interpolate(
-                m.float(), size=(oh, ow), mode="bicubic", align_corners=False, antialias=True
+                m, size=(oh, ow), mode="bicubic", align_corners=False, antialias=True
             ).clamp_(0.0, 1.0)
-            out.append(m[0, 0])
+            out.append(m[0, 0].float())
         return out
 
     @torch.inference_mode()
@@ -364,11 +366,15 @@ class BiRefNetPredictor:
         )
         with ctx:
             out = self.model(x)
-        if isinstance(out, (list, tuple)):
-            logits = out[-1]
-        else:
-            logits = out
-        return logits.float().sigmoid()
+            if isinstance(out, (list, tuple)):
+                logits = out[-1]
+            else:
+                logits = out
+            # sigmoid stays in autocast dtype (bf16 if amp on); the upsample
+            # happens in the same dtype to halve interpolate memory at HR.
+            # The fp32 cast moves to the predict() boundary right before
+            # the user receives the mask.
+            return logits.sigmoid()
 
     def _refine_foreground_np(self, rgb: np.ndarray, alpha: np.ndarray, r: int = 90) -> np.ndarray:
         """Photoroom-style two-pass blur fusion foreground estimation.
