@@ -347,6 +347,8 @@ class BasicLayer(nn.Module):
         self.shift_size = window_size // 2
         self.depth = depth
         self.use_checkpoint = use_checkpoint
+        # Plain dict (not Buffer/Module/Parameter) → not serialized in state_dict.
+        self._attn_mask_cache: dict = {}
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -370,19 +372,24 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, H, W):
-        """ Forward function.
+    def _get_attn_mask(self, H: int, W: int, dtype, device):
+        """Build (or look up) the SW-MSA attention mask for an H x W feature map.
 
-        Args:
-            x: Input feature, tensor size (B, H*W, C).
-            H, W: Spatial resolution of the input feature.
+        The mask depends only on (Hp, Wp, window_size, shift_size, dtype, device);
+        cache up to 4 entries to keep VRAM bounded under dynamic-size training.
+        At 1024² Swin stage 1 this saves ~12 MB of zeros + slice writes per call.
         """
-
-        # calculate attention mask for SW-MSA
-        # Turn int to torch.tensor for the compatiability with torch.compile in PyTorch >= 2.5.
-        Hp = torch.ceil(torch.tensor(H) / self.window_size).to(torch.int64) * self.window_size
-        Wp = torch.ceil(torch.tensor(W) / self.window_size).to(torch.int64) * self.window_size
-        img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
+        Hp = ((H + self.window_size - 1) // self.window_size) * self.window_size
+        Wp = ((W + self.window_size - 1) // self.window_size) * self.window_size
+        key = (Hp, Wp, dtype, str(device))
+        cached = self._attn_mask_cache.get(key)
+        if cached is not None:
+            return cached
+        if len(self._attn_mask_cache) >= 4:
+            # Drop oldest entry (insertion order). Avoids unbounded growth
+            # when the model is exercised across many shapes.
+            self._attn_mask_cache.pop(next(iter(self._attn_mask_cache)))
+        img_mask = torch.zeros((1, Hp, Wp, 1), device=device)
         h_slices = (slice(0, -self.window_size),
                     slice(-self.window_size, -self.shift_size),
                     slice(-self.shift_size, None))
@@ -394,11 +401,24 @@ class BasicLayer(nn.Module):
             for w in w_slices:
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
-
-        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+        mask_windows = window_partition(img_mask, self.window_size)
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float('-inf')).masked_fill(attn_mask == 0, float(0.0)).to(x.dtype)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float('-inf')).masked_fill(attn_mask == 0, float(0.0)).to(dtype)
+        self._attn_mask_cache[key] = attn_mask
+        return attn_mask
+
+    def forward(self, x, H, W):
+        """ Forward function.
+
+        Args:
+            x: Input feature, tensor size (B, H*W, C).
+            H, W: Spatial resolution of the input feature.
+        """
+
+        # SW-MSA attention mask depends only on (H, W, dtype, device); cache it
+        # to avoid rebuilding ~100MB of mask tensors every forward at HR.
+        attn_mask = self._get_attn_mask(int(H), int(W), x.dtype, x.device)
 
         for blk in self.blocks:
             blk.H, blk.W = H, W
