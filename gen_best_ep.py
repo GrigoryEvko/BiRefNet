@@ -28,7 +28,12 @@ for metric in metrics:
             properties = line.strip().strip(sep).split(sep)
             dataset = properties[0].strip()
             ckpt = properties[1].strip()
-            if int(ckpt.split('--epoch_')[-1].strip()) < 0:
+            try:
+                epoch_num = int(ckpt.split('--epoch_')[-1].strip())
+            except (ValueError, IndexError):
+                # Skip ckpt names that don't follow the '<dir>--epoch_N' format.
+                continue
+            if epoch_num < 0:
                 continue
             targe_idx = {
                 'sm': [5, 2, 2, 5, 5, 2],

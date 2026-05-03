@@ -62,9 +62,14 @@ def main(args):
     else:
         print('Undefined model: {}.'.format(config.model))
         return None
+    def _epoch_of(path):
+        # 'foo/epoch_42.pth' → 42. Tolerate stems whose last char is in
+        # {'.', 'p', 't', 'h'} which the previous rstrip('.pth') corrupted.
+        stem = os.path.splitext(os.path.basename(path))[0]
+        return int(stem.split('epoch_')[-1])
     weights_lst = sorted(
         glob(os.path.join(args.ckpt_folder, '*.pth')) if args.ckpt_folder else [args.ckpt],
-        key=lambda x: int(x.split('epoch_')[-1].split('.pth')[0]),
+        key=_epoch_of,
         reverse=True
     )
     try:
@@ -87,16 +92,19 @@ def main(args):
             batch_size=config.batch_size_valid, shuffle=False, num_workers=config.num_workers, pin_memory=True
         )
         for weights in weights_lst:
-            if int(weights.strip('.pth').split('epoch_')[-1]) % 1 != 0:
-                continue
+            # The previous `% 1 != 0` filter was always False (dead code). The
+            # original intent was filtering by step; restoring that requires a
+            # `--step` flag, which we don't have here. So just iterate every
+            # checkpoint, which is what was happening anyway.
             print('\tInferencing {}...'.format(weights))
             state_dict = torch.load(weights, map_location='cpu', weights_only=True)
             state_dict = check_state_dict(state_dict)
             model.load_state_dict(state_dict)
             model = model.to(device)
+            stems = [os.path.splitext(w)[0] for w in weights.split(os.sep)[-2:]]
             inference(
                 model, data_loader_test=data_loader_test, pred_root=args.pred_root,
-                method='--'.join([w.rstrip('.pth') for w in weights.split(os.sep)[-2:]]) + '-reso_{}'.format('x'.join([str(s) for s in data_size])),
+                method='--'.join(stems) + '-reso_{}'.format('x'.join([str(s) for s in data_size])),
                 testset=testset, device=config.device
             )
 
