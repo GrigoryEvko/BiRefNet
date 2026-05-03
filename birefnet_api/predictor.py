@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from birefnet_api.buckets import aspect_bucket, nearest_bucket
+from birefnet_api.buckets import aspect_bucket, fit_into_bucket, nearest_bucket
 
 _LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
@@ -19,21 +19,51 @@ _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+def _np_to_uint8(arr: np.ndarray) -> np.ndarray:
+    """Convert an HWC or HW numpy array to uint8, auto-detecting common ranges.
+
+    - uint8 → returned as-is
+    - integer non-uint8 (uint16, int32, ...): rescaled by max-magnitude into
+      [0, 255], not blindly truncated mod 256 (the original wrapper did the
+      latter).
+    - floating: detects [0,1] vs [0,255] vs general by inspecting the max
+      value. Float in [0, 1.5] is treated as [0,1] (×255); anything above
+      that is treated as already-[0,255] and just clipped.
+    """
+    if arr.dtype == np.uint8:
+        return arr
+    if np.issubdtype(arr.dtype, np.integer):
+        # rescale into [0, 255] using observed range
+        a_min = float(arr.min())
+        a_max = float(arr.max())
+        if a_max <= a_min:
+            return np.zeros_like(arr, dtype=np.uint8)
+        return ((arr.astype(np.float64) - a_min) * (255.0 / (a_max - a_min))).astype(np.uint8)
+    if np.issubdtype(arr.dtype, np.floating):
+        a_max = float(np.nanmax(arr)) if arr.size else 0.0
+        if a_max <= 1.5:
+            return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        return np.clip(arr, 0, 255).astype(np.uint8)
+    raise TypeError(f"unsupported numpy dtype: {arr.dtype}")
+
+
 def _load_pil(image: ImageInput) -> Image.Image:
     if isinstance(image, (str, os.PathLike)):
-        return Image.open(os.fspath(image))
+        # Use a context manager so the file handle is released; .copy()
+        # detaches the pixel data so we can keep using it after the file closes.
+        with Image.open(os.fspath(image)) as fp:
+            fp.load()
+            return fp.copy()
     if isinstance(image, Image.Image):
         return image
     if isinstance(image, np.ndarray):
         arr = image
         if arr.ndim == 2:
-            return Image.fromarray(arr.astype(np.uint8) if arr.dtype != np.uint8 else arr, mode="L").convert("RGB")
+            arr = _np_to_uint8(arr)
+            return Image.fromarray(arr, mode="L").convert("RGB")
         if arr.shape[-1] == 4:
             arr = arr[..., :3]
-        if arr.dtype != np.uint8:
-            if np.issubdtype(arr.dtype, np.floating):
-                arr = np.clip(arr, 0.0, 1.0) * 255.0
-            arr = arr.astype(np.uint8)
+        arr = _np_to_uint8(arr)
         return Image.fromarray(np.ascontiguousarray(arr))
     if isinstance(image, torch.Tensor):
         t = image.detach()
@@ -43,6 +73,9 @@ def _load_pil(image: ImageInput) -> Image.Image:
             t = t.squeeze(0)
         if t.ndim != 3:
             raise ValueError(f"unsupported tensor shape {tuple(t.shape)}")
+        # CHW → HWC. Heuristic: if dim 0 looks like channels (1/3/4) AND the
+        # last dim does NOT, permute. Symmetric ambiguous cases (3×3×H) bias
+        # toward CHW because deep-learning code overwhelmingly produces that.
         if t.shape[0] in (1, 3, 4) and t.shape[-1] not in (1, 3, 4):
             t = t.permute(1, 2, 0)
         if t.shape[-1] == 4:
@@ -50,9 +83,21 @@ def _load_pil(image: ImageInput) -> Image.Image:
         if t.shape[-1] == 1:
             t = t.expand(-1, -1, 3)
         if t.is_floating_point():
-            arr = (t.clamp(0, 1).cpu() * 255.0).to(torch.uint8).numpy()
+            t_max = float(t.max().item()) if t.numel() else 0.0
+            if t_max <= 1.5:
+                arr = (t.clamp(0, 1).cpu() * 255.0).to(torch.uint8).numpy()
+            else:
+                arr = t.clamp(0, 255).to(torch.uint8).cpu().numpy()
         else:
-            arr = t.to(torch.uint8).cpu().numpy()
+            # Integer: rescale by observed range, don't truncate uint8 mod 256.
+            t = t.cpu()
+            t_min = int(t.min().item())
+            t_max = int(t.max().item())
+            if t_max <= t_min:
+                arr = np.zeros(tuple(t.shape), dtype=np.uint8)
+            else:
+                f = (t.to(torch.float64) - t_min) * (255.0 / (t_max - t_min))
+                arr = f.clamp(0, 255).to(torch.uint8).numpy()
         return Image.fromarray(np.ascontiguousarray(arr))
     raise TypeError(f"unsupported image type: {type(image)!r}")
 
@@ -199,10 +244,20 @@ class BiRefNetPredictor:
             return []
         bucket_hw = self._pick_batch_bucket([item[1] for item in items], max_edge)
 
+        # Letterbox-resize into the bucket so heterogeneous aspects stay sane:
+        # the previous _pick_batch_bucket took (max_h, max_w) from independent
+        # images and resized everyone to that aspect, distorting both ends.
         tensors = []
-        for pil, _ in items:
-            resized = pil.resize((bucket_hw[1], bucket_hw[0]), _LANCZOS)
-            tensors.append(_pil_to_rgb_tensor(resized, self.device))
+        pads = []
+        for pil, (oh, ow) in items:
+            (rh, rw), (pt, pb, pl, pr) = fit_into_bucket((oh, ow), bucket_hw)
+            resized = pil.resize((rw, rh), _LANCZOS)
+            t = _pil_to_rgb_tensor(resized, self.device)
+            if (pt, pb, pl, pr) != (0, 0, 0, 0):
+                # F.pad takes (left, right, top, bottom)
+                t = F.pad(t.unsqueeze(0), (pl, pr, pt, pb), mode="replicate").squeeze(0)
+            tensors.append(t)
+            pads.append((pt, pb, pl, pr, rh, rw))
         x = torch.stack(tensors, dim=0)
         if self.normalize:
             x = (x - self._mean) / self._std
@@ -211,11 +266,27 @@ class BiRefNetPredictor:
         if self.amp_dtype is not None and self.device.type == "cuda":
             x = x.to(self.amp_dtype)
 
-        masks = self._forward(x)  # [B,1,h,w]
+        masks = self._forward(x)  # [B,1,bh,bw]
+        # Crop the letterbox padding from each mask, then upsample to the
+        # corresponding original resolution. The mask spatial size may not equal
+        # bucket_hw exactly (decoder keeps it the same in BiRefNet), so we map
+        # pad amounts proportionally.
         out = []
+        bh, bw = bucket_hw
+        m_h, m_w = masks.shape[-2], masks.shape[-1]
         for i, (_, (oh, ow)) in enumerate(items):
+            pt, pb, pl, pr, _rh, _rw = pads[i]
+            top = int(round(pt * m_h / bh))
+            bot_off = int(round(pb * m_h / bh))
+            left = int(round(pl * m_w / bw))
+            right_off = int(round(pr * m_w / bw))
+            m = masks[
+                i : i + 1, :,
+                top : (m_h - bot_off) if bot_off else m_h,
+                left : (m_w - right_off) if right_off else m_w,
+            ]
             m = F.interpolate(
-                masks[i : i + 1], size=(oh, ow), mode="bicubic", align_corners=False, antialias=True
+                m.float(), size=(oh, ow), mode="bicubic", align_corners=False, antialias=True
             ).clamp_(0.0, 1.0)
             out.append(m[0, 0])
         return out
@@ -263,13 +334,23 @@ class BiRefNetPredictor:
         return aspect_bucket(orig_hw, max_edge=max_edge, multiple=self.multiple)
 
     def _pick_batch_bucket(self, items_hw: List[Tuple[int, int]], max_edge: int) -> Tuple[int, int]:
+        """Pick a single (bucket_h, bucket_w) for the batch.
+
+        With explicit buckets: snap to the most-common nearest bucket.
+        Without explicit buckets: pick the largest aspect_bucket across the
+        items, which is the smallest bucket every image fits inside (after
+        letterbox padding) without upscaling beyond max_edge.
+        """
         if self.buckets:
             from collections import Counter
             picks = [nearest_bucket(hw, self.buckets) for hw in items_hw]
             return Counter(picks).most_common(1)[0][0]
-        max_h = max(hw[0] for hw in items_hw)
-        max_w = max(hw[1] for hw in items_hw)
-        return aspect_bucket((max_h, max_w), max_edge=max_edge, multiple=self.multiple)
+        per_item = [aspect_bucket(hw, max_edge=max_edge, multiple=self.multiple) for hw in items_hw]
+        # Take the per-axis max so every image can be letterbox'd into it
+        # without upscaling. (Aspect distortion is avoided by the letterbox.)
+        bh = max(b[0] for b in per_item)
+        bw = max(b[1] for b in per_item)
+        return (bh, bw)
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = (
@@ -286,14 +367,19 @@ class BiRefNetPredictor:
         return logits.float().sigmoid()
 
     def _refine_foreground_np(self, rgb: np.ndarray, alpha: np.ndarray, r: int = 90) -> np.ndarray:
-        """Photoroom-style two-pass blur fusion foreground estimation, on GPU.
+        """Photoroom-style two-pass blur fusion foreground estimation.
 
-        Inputs are uint8 HWC and HW respectively. Output is uint8 HWC at the same
-        resolution. Falls back gracefully if `r >= min(H, W)`.
+        Inputs are uint8 HWC and HW respectively. Output is uint8 HWC at the
+        same resolution. Picks GPU vs CPU automatically based on free VRAM —
+        the GPU path otherwise OOMs on multi-megapixel inputs (a 12K image
+        needs ~5 GB transient float buffers).
         """
         h, w = alpha.shape
         r = max(1, min(int(r), max(1, min(h, w) - 1)))
-        device = self.device
+        # ~7 fp32 buffers of (h, w, 3) survive simultaneously through the
+        # two _fb_blur_pass calls. Be conservative.
+        est_bytes = h * w * 3 * 4 * 8
+        device = self._pick_refine_device(est_bytes)
         rgb_arr = np.array(rgb, copy=True)
         alpha_arr = np.array(alpha, copy=True)
         rgb_t = torch.from_numpy(rgb_arr).to(device).float().div_(255.0).permute(2, 0, 1).unsqueeze(0)
@@ -302,6 +388,22 @@ class BiRefNetPredictor:
         fg, _ = _fb_blur_pass(rgb_t, fg, blur_b, alpha_t, max(1, min(6, r)))
         out = fg.clamp_(0.0, 1.0).mul_(255.0).round_().byte()
         return out[0].permute(1, 2, 0).contiguous().cpu().numpy()
+
+    def _pick_refine_device(self, est_bytes: int) -> torch.device:
+        """Decide whether the foreground refine step fits on self.device.
+
+        Falls back to CPU when self.device is CUDA and est_bytes exceeds 60%
+        of free VRAM (leaves headroom for the model and other allocations).
+        """
+        if self.device.type != "cuda":
+            return self.device
+        try:
+            free, _total = torch.cuda.mem_get_info(self.device)
+        except Exception:
+            return self.device
+        if est_bytes > 0.6 * free:
+            return torch.device("cpu")
+        return self.device
 
 
 def _box_blur(x: torch.Tensor, r: int) -> torch.Tensor:
