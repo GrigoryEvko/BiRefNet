@@ -330,6 +330,7 @@ def _get_adaptive_threshold(matrix: np.ndarray, max_value: float = 1) -> float:
 class FMeasure(object):
     def __init__(self, beta: float = 0.3):
         self.beta = beta
+        self.beta_sq = beta * beta
         self.precisions = []
         self.recalls = []
         self.adaptive_fms = []
@@ -355,7 +356,10 @@ class FMeasure(object):
         else:
             pre = area_intersection / np.count_nonzero(binary_predcition)
             rec = area_intersection / np.count_nonzero(gt)
-            adaptive_fm = (1 + self.beta) * pre * rec / (self.beta * pre + rec)
+            # Standard weighted F-measure uses beta^2, not beta.
+            # The original code shipped with `beta` here, which inflated all
+            # reported FMeasure scores at the default beta=0.3.
+            adaptive_fm = (1 + self.beta_sq) * pre * rec / (self.beta_sq * pre + rec)
         return adaptive_fm
 
     def cal_pr(self, pred: np.ndarray, gt: np.ndarray) -> tuple:
@@ -371,8 +375,8 @@ class FMeasure(object):
         T = max(np.count_nonzero(gt), 1)
         precisions = TPs / Ps
         recalls = TPs / T
-        numerator = (1 + self.beta) * precisions * recalls
-        denominator = np.where(numerator == 0, 1, self.beta * precisions + recalls)
+        numerator = (1 + self.beta_sq) * precisions * recalls
+        denominator = np.where(numerator == 0, 1, self.beta_sq * precisions + recalls)
         changeable_fms = numerator / denominator
         return precisions, recalls, changeable_fms
 
@@ -648,6 +652,7 @@ class EMeasure(object):
 class WeightedFMeasure(object):
     def __init__(self, beta: float = 1):
         self.beta = beta
+        self.beta_sq = beta * beta
         self.weighted_fms = []
 
     def step(self, pred: np.ndarray, gt: np.ndarray):
@@ -688,8 +693,11 @@ class WeightedFMeasure(object):
         R = 1 - np.mean(Ew[gt == 1])
         P = TPw / (TPw + FPw + _EPS)
 
-        # % Q = (1+Beta^2)*(R*P)./(eps+R+(Beta.*P));
-        Q = (1 + self.beta) * R * P / (R + self.beta * P + _EPS)
+        # Standard weighted F-measure: Q = (1+β²)*P*R / (β²*P + R).
+        # The original code used `beta` instead of `beta**2`; coincidentally
+        # correct for the default beta=1 (1+β == 1+β² == 2 there) but wrong
+        # for any other beta.
+        Q = (1 + self.beta_sq) * R * P / (R + self.beta_sq * P + _EPS)
 
         return Q
 
