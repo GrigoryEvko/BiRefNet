@@ -912,7 +912,7 @@ class MBAMeasure(object):
         max_radius = (w+h)/300
         num_steps = 5
 
-        pred_acc = [None] * num_steps
+        pred_acc = []
 
         for i in range(num_steps):
             curr_radius = min_radius + int((max_radius-min_radius)/num_steps*i)
@@ -920,16 +920,22 @@ class MBAMeasure(object):
             kernel = self.get_disk_kernel(curr_radius)
             boundary_region = cv2.morphologyEx(gt, cv2.MORPH_GRADIENT, kernel) > 0
 
+            num_edge_pixels = int(boundary_region.sum())
+            if num_edge_pixels == 0:
+                # No boundary at this radius (flat GT or radius wider than the
+                # mask) → no signal to average. Skip rather than divide by zero
+                # and inject NaN into the dataset-wide MBA.
+                continue
+
             gt_in_bound = gt[boundary_region]
             pred_in_bound = pred[boundary_region]
-
-            num_edge_pixels = (boundary_region).sum()
             num_pred_gd_pix = ((gt_in_bound) * (pred_in_bound) + (1-gt_in_bound) * (1-pred_in_bound)).sum()
+            pred_acc.append(num_pred_gd_pix / num_edge_pixels)
 
-            pred_acc[i] = num_pred_gd_pix / num_edge_pixels
-
-        ba = sum(pred_acc)/num_steps
-        return ba
+        if not pred_acc:
+            # GT has no boundary at any of the 5 radii → vacuously "perfect".
+            return 1.0
+        return sum(pred_acc) / len(pred_acc)
 
     def get_results(self) -> dict:
         mba = np.mean(np.array(self.bas, _TYPE))
