@@ -42,8 +42,15 @@ def real_predictor():
     from birefnet_api import BiRefNetPredictor
 
     repo_id = os.environ.get("BIREFNET_PRETRAINED_REPO", "ZhengPeng7/BiRefNet")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = "bf16" if torch.cuda.is_available() else None
+    # BIREFNET_PRETRAINED_DEVICE forces CPU on boxes whose torchvision lacks
+    # the CUDA deform_conv2d kernel (the deformable-ASPP path crashes on
+    # such installs even though the rest of the model would run on CUDA).
+    forced = os.environ.get("BIREFNET_PRETRAINED_DEVICE")
+    if forced:
+        device = forced
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = "bf16" if device == "cuda" else None
     try:
         return BiRefNetPredictor.from_pretrained(repo_id, device=device, dtype=dtype, max_edge=1024)
     except Exception as e:
