@@ -55,6 +55,11 @@ class Config():
                                                                 # 3. But compile in 2.0.1 < Pytorch < 2.5.0 seems to bring no acceleration for training.
 
         # MODEL settings
+        # Set to True for pretrained-weight compatibility with the upstream
+        # ZhengPeng7/BiRefNet checkpoints (which were trained with
+        # align_corners=True everywhere). Set to False for new training to
+        # match what F.interpolate considers correct geometry.
+        self.align_corners = True
         self.ms_supervision = True
         self.out_ref = self.ms_supervision and True
         self.dec_ipt = True

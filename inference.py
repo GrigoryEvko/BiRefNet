@@ -42,7 +42,7 @@ def inference(model, data_loader_test, pred_root, method, testset, device=0):
                 scaled_preds[idx_sample].unsqueeze(0),
                 size=cv2.imread(label_paths[idx_sample], cv2.IMREAD_GRAYSCALE).shape[:2],
                 mode='bilinear',
-                align_corners=False
+                align_corners=bool(getattr(config, 'align_corners', True))
             )
             save_tensor_img(res, os.path.join(os.path.join(pred_root, method, testset), label_paths[idx_sample].replace('\\', '/').split('/')[-1]))   # test set dir + file name
     if model_training:

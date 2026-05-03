@@ -1,6 +1,9 @@
 import os
 # Set CUDA allocator env vars BEFORE importing torch — once torch is imported the
 # CUDA caching allocator may have already been initialized on some platforms.
+# Track whether *we* set it; if the user already had a value (e.g.
+# `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128`) leave it alone and never pop.
+_alloc_conf_was_user_set = 'PYTORCH_CUDA_ALLOC_CONF' in os.environ
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import datetime
@@ -21,9 +24,11 @@ def _torch_version_at_least(major: int, minor: int, patch: int = 0) -> bool:
     return cur >= (major, minor, patch)
 
 
-if not _torch_version_at_least(2, 5, 0):
+if not _alloc_conf_was_user_set and not _torch_version_at_least(2, 5, 0):
     # Below 2.5.0 didn't support expandable_segments; clear the env var so we
-    # don't poison the runtime with a value the allocator rejects.
+    # don't poison the runtime with a value the allocator rejects. Only do
+    # this when the value was set by us — otherwise we'd silently drop the
+    # user's own configuration.
     os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
 
 from config import Config
@@ -207,7 +212,8 @@ class Trainer:
                 # _gdt_label is laplacian(input)*mask_logit; sigmoid gives a soft
                 # target in (0,1) that BCEWithLogitsLoss accepts directly.
                 _gdt_pred = nn.functional.interpolate(
-                    _gdt_pred, size=_gdt_label.shape[2:], mode='bilinear', align_corners=False
+                    _gdt_pred, size=_gdt_label.shape[2:], mode='bilinear',
+                    align_corners=bool(getattr(config, 'align_corners', True))
                 )
                 _gdt_label = _gdt_label.sigmoid()
                 loss_gdt = loss_gdt + self.criterion_gdt(_gdt_pred, _gdt_label)
