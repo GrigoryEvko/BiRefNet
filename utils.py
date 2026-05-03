@@ -9,16 +9,24 @@ from PIL import Image
 
 
 def path_to_image(path, size=(1024, 1024), color_type=['rgb', 'gray'][0]):
-    if color_type.lower() == 'rgb':
+    """Load an image from disk and return it as a PIL Image at the given size.
+
+    cv2.imread silently returns None on read failure (missing file, permission
+    error, unsupported format); cv2.resize would then crash with a confusing
+    error. Validate the read and raise a FileNotFoundError that names the path.
+    """
+    ct = color_type.lower()
+    if ct == 'rgb':
         image = cv2.imread(path)
-    elif color_type.lower() == 'gray':
+    elif ct == 'gray':
         image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     else:
-        print('Select the color_type to return, either to RGB or gray image.')
-        return
+        raise ValueError(f"color_type must be 'rgb' or 'gray', got {color_type!r}")
+    if image is None:
+        raise FileNotFoundError(f"cv2.imread returned None for {path!r} — file missing, unreadable, or unsupported format")
     if size:
         image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
-    if color_type.lower() == 'rgb':
+    if ct == 'rgb':
         image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).convert('RGB')
     else:
         image = Image.fromarray(image).convert('L')

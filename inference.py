@@ -33,7 +33,10 @@ def inference(model, data_loader_test, pred_root, method, testset, device=0):
         inputs = batch[0].to(device)
         label_paths = batch[-1]
         with autocast_ctx, torch.no_grad():
-            scaled_preds = model(inputs)[-1].sigmoid().to(torch.float32)
+            logits = model(inputs)[-1]
+        # Cast outside autocast so the sigmoid runs in fp32 — and we don't
+        # waste a bf16 sigmoid that gets immediately upcast.
+        scaled_preds = logits.float().sigmoid()
 
         os.makedirs(os.path.join(pred_root, method, testset), exist_ok=True)
 
