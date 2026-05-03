@@ -1,3 +1,4 @@
+import threading
 from collections import OrderedDict
 
 import numpy as np
@@ -115,13 +116,17 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         # Cache for the gathered + cast bias used in eval. Rebuilt every forward
         # in training because relative_position_bias_table changes each step.
+        # Lock guards the cache against concurrent forward() calls in
+        # threaded servers (FastAPI run_in_threadpool, --workers N, etc.).
         self._rpb_cache: dict = {}
+        self._rpb_lock = threading.Lock()
 
     def train(self, mode: bool = True):
         """Clear the eval-time bias cache when switching to train mode — the
         bias_table will start changing again, so cached views go stale."""
         if mode:
-            self._rpb_cache = {}
+            with self._rpb_lock:
+                self._rpb_cache = {}
         return super().train(mode)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
@@ -133,7 +138,8 @@ class WindowAttention(nn.Module):
             model.eval(); model(x); model.load_state_dict(other); model(x)
         returns biases derived from the FIRST checkpoint on the second call.
         """
-        self._rpb_cache = {}
+        with self._rpb_lock:
+            self._rpb_cache = {}
         return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def _relative_position_bias(self, q):
@@ -141,6 +147,11 @@ class WindowAttention(nn.Module):
 
         Shape: (1, num_heads, N, N) where N = Wh*Ww. In eval mode we cache
         per (dtype, device) — the table is fixed so the gathered tensor is too.
+
+        Thread-safe via double-checked locking: cheap fast path (lookup
+        without lock), only acquire the lock to mutate. Two threads might
+        both miss and both build, but only one wins the insert; both end
+        up returning the same stored tensor.
         """
         N = self.window_size[0] * self.window_size[1]
         if self.training:
@@ -151,11 +162,17 @@ class WindowAttention(nn.Module):
         cached = self._rpb_cache.get(key)
         if cached is not None:
             return cached
+        # Build outside the lock — duplicate work under contention is cheap
+        # (~6KB tensor) and lets concurrent forwards on different keys proceed.
         rpb = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             N, N, -1
         ).permute(2, 0, 1).unsqueeze(0).to(dtype=q.dtype, device=q.device).contiguous()
-        self._rpb_cache[key] = rpb
-        return rpb
+        with self._rpb_lock:
+            existing = self._rpb_cache.get(key)
+            if existing is not None:
+                return existing  # another thread won the race
+            self._rpb_cache[key] = rpb
+            return rpb
 
     def forward(self, x, mask=None):
         """ Forward function.
@@ -392,7 +409,10 @@ class BasicLayer(nn.Module):
         self.use_checkpoint = use_checkpoint
         # OrderedDict (not Buffer/Module/Parameter) → not serialized in state_dict.
         # Used as an LRU cache: move_to_end on hit, popitem(last=False) to evict.
+        # Lock guards the LRU updates against concurrent forward() — without it,
+        # move_to_end racing with popitem can KeyError under threaded servers.
         self._attn_mask_cache: OrderedDict = OrderedDict()
+        self._attn_mask_lock = threading.Lock()
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -423,18 +443,23 @@ class BasicLayer(nn.Module):
         cache up to 4 entries with LRU eviction so an active size doesn't get
         evicted when a new transient size shows up. At 1024² Swin stage 1 this
         saves ~12 MB of zeros + slice writes per call.
+
+        Thread-safe: the LRU update + eviction sequence holds a per-instance
+        lock. Without it, concurrent forward()s in a threaded server (FastAPI
+        run_in_threadpool, --workers, etc.) can KeyError when one thread's
+        move_to_end races with another's popitem.
         """
         Hp = ((H + self.window_size - 1) // self.window_size) * self.window_size
         Wp = ((W + self.window_size - 1) // self.window_size) * self.window_size
         key = (Hp, Wp, dtype, str(device))
-        cached = self._attn_mask_cache.get(key)
-        if cached is not None:
-            # Mark as most-recently-used — true LRU semantics.
-            self._attn_mask_cache.move_to_end(key)
-            return cached
-        if len(self._attn_mask_cache) >= 4:
-            # Evict least-recently-used entry, not least-recently-inserted.
-            self._attn_mask_cache.popitem(last=False)
+        # Fast path: check under lock to make LRU update atomic with the get.
+        with self._attn_mask_lock:
+            cached = self._attn_mask_cache.get(key)
+            if cached is not None:
+                self._attn_mask_cache.move_to_end(key)
+                return cached
+        # Build outside the lock — concurrent misses on different keys
+        # proceed in parallel. Same-key duplicate work is wasted but bounded.
         img_mask = torch.zeros((1, Hp, Wp, 1), device=device)
         h_slices = (slice(0, -self.window_size),
                     slice(-self.window_size, -self.shift_size),
@@ -460,8 +485,17 @@ class BasicLayer(nn.Module):
                      .masked_fill(attn_mask == 0, 0.0)
                      .to(dtype)
         )
-        self._attn_mask_cache[key] = attn_mask
-        return attn_mask
+        # Insert under lock; another thread may have beaten us, in which case
+        # we keep their value (so callers consistently see the same tensor).
+        with self._attn_mask_lock:
+            existing = self._attn_mask_cache.get(key)
+            if existing is not None:
+                self._attn_mask_cache.move_to_end(key)
+                return existing
+            if len(self._attn_mask_cache) >= 4:
+                self._attn_mask_cache.popitem(last=False)
+            self._attn_mask_cache[key] = attn_mask
+            return attn_mask
 
     def forward(self, x, H, W):
         """ Forward function.
