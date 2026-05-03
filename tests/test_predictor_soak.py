@@ -155,3 +155,46 @@ def test_cuda_predict_does_not_leak_vram():
     assert growth_mb < 50, (
         f"VRAM grew by {growth_mb:.1f} MB over 95 predicts — possible leak"
     )
+
+
+def test_real_model_swin_caches_dont_grow_unboundedly():
+    """Soak with the actual BiRefNet (Swin-L by default) — exercises the
+    Swin attn_mask LRU + rpb caches across many forwards. Catches leaks
+    specific to the production model graph (cache reference cycles, etc.)
+    that the _TinyModel-based tests above can't reach.
+    """
+    pytest.importorskip("kornia")
+    pytest.importorskip("cv2")
+
+    import config as _config
+    _orig = _config.Config.__init__
+    def _safe(self):
+        try:
+            _orig(self)
+        except FileNotFoundError:
+            pass
+    _config.Config.__init__ = _safe
+    try:
+        from models.birefnet import BiRefNet
+        model = BiRefNet(bb_pretrained=False)
+    finally:
+        _config.Config.__init__ = _orig
+    pred = BiRefNetPredictor(model, device="cpu", dtype=None, max_edge=192)
+
+    img = _gradient_pil(192, 192)
+    # Warm-up.
+    for _ in range(2):
+        pred.predict(img)
+    gc.collect()
+    baseline = len(gc.get_objects())
+    for _ in range(8):
+        pred.predict(img)
+    gc.collect()
+    final = len(gc.get_objects())
+    growth = final - baseline
+    # 8 predicts on a 200M-param Swin-L should grow well under 5K objects
+    # if caches are stable. Headroom for pytest's own bookkeeping.
+    assert growth < 10_000, (
+        f"object count grew by {growth} over 8 real-model predicts — "
+        f"Swin caches or model intermediate state may be leaking"
+    )

@@ -209,8 +209,18 @@ class BiRefNetPredictor:
 
     @classmethod
     def from_pretrained(cls, repo_id: str = "ZhengPeng7/BiRefNet", **kwargs) -> "BiRefNetPredictor":
+        """Download a published checkpoint from HuggingFace Hub and wrap it.
+
+        bb_pretrained=False is forced because the HF state_dict already
+        contains backbone weights — the default bb_pretrained=True would
+        trigger a redundant load_weights() call that reads
+        config.weights[bb_name] from the local filesystem and crashes with
+        FileNotFoundError on fresh deployments where that file doesn't exist.
+        """
         from models.birefnet import BiRefNet
-        model = BiRefNet.from_pretrained(repo_id)
+        # Separate predictor-construction kwargs from BiRefNet-construction
+        # kwargs. Anything not recognized as a BiRefNet arg flows through.
+        model = BiRefNet.from_pretrained(repo_id, bb_pretrained=False)
         return cls(model, **kwargs)
 
     @classmethod

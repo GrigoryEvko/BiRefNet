@@ -5,6 +5,21 @@ CUDA 13.x. The HEAD set of changes is documented below grouped by impact
 class. Anything marked **BREAKING** changes existing user-visible behavior;
 read those before pulling into an existing deployment.
 
+**Verified end-to-end against the real upstream `ZhengPeng7/BiRefNet`
+checkpoint** (downloaded from HF Hub, run on a fresh deploy, no local
+backbone weights file present). All four pretrained-smoke tests pass,
+including the disk-image foreground/background separation > 0.1 check
+that confirms `align_corners=True` default produces semantically correct
+masks. The 4K HR-input test passes too. See
+`tests/test_pretrained_smoke.py`.
+
+The remaining production-hardware-only verification: bf16 + CUDA
+deform_conv2d kernel availability. The CPU-only torchvision wheel on
+this dev box lacks the CUDA deform_conv2d kernel; the user's k8s images
+ship a full torchvision so the bf16 path will exercise on first L40S
+boot. Run `BIREFNET_TEST_PRETRAINED=1 pytest tests/test_pretrained_smoke.py`
+on the L40S to close this loop.
+
 ## Unreleased
 
 ### BREAKING
