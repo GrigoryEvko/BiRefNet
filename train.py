@@ -291,17 +291,34 @@ def main():
         model_opt_lrsch=init_models_optimizers(args.epochs, to_be_distributed)
     )
 
-    for epoch in range(epoch_st, args.epochs+1):
-        train_loss = trainer.train_epoch(epoch)
-        # Save checkpoint
-        if epoch >= args.epochs - config.save_last and epoch % config.save_step == 0:
-            if args.use_accelerate:
-                state_dict = trainer.model.state_dict()
-            else:
-                state_dict = trainer.model.module.state_dict() if to_be_distributed else trainer.model.state_dict()
-            torch.save(state_dict, os.path.join(args.ckpt_dir, 'epoch_{}.pth'.format(epoch)))
-    if to_be_distributed:
-        destroy_process_group()
+    try:
+        for epoch in range(epoch_st, args.epochs+1):
+            train_loss = trainer.train_epoch(epoch)
+            # Save checkpoint
+            if epoch >= args.epochs - config.save_last and epoch % config.save_step == 0:
+                if args.use_accelerate:
+                    # Save once from main process; unwrap to drop accelerate's
+                    # DDP/compile wrappers so the checkpoint is portable. Using
+                    # trainer.model.state_dict() on every rank wrote the same
+                    # file N times and corrupted under concurrent fsync.
+                    if accelerator.is_main_process:
+                        unwrapped = accelerator.unwrap_model(trainer.model)
+                        accelerator.save(
+                            unwrapped.state_dict(),
+                            os.path.join(args.ckpt_dir, 'epoch_{}.pth'.format(epoch)),
+                        )
+                else:
+                    state_dict = trainer.model.module.state_dict() if to_be_distributed else trainer.model.state_dict()
+                    # Vanilla DDP: rank 0 only — gradient ranks shouldn't race
+                    # on the same file.
+                    if not to_be_distributed or torch.distributed.get_rank() == 0:
+                        torch.save(state_dict, os.path.join(args.ckpt_dir, 'epoch_{}.pth'.format(epoch)))
+    finally:
+        # destroy_process_group must run on Ctrl-C / unexpected exit too —
+        # otherwise NCCL leaves zombie comms in /dev/shm and the next launch
+        # gets EADDRINUSE on the rendezvous port.
+        if to_be_distributed:
+            destroy_process_group()
 
 
 if __name__ == '__main__':
