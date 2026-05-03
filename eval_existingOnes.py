@@ -39,7 +39,11 @@ def do_eval(args):
                 pred_paths=pred_paths,
                 metrics=args.metrics.split('+'),
                 verbose=config.verbose_eval,
-                num_workers=min(8, int(os.cpu_count() * 0.9)),
+                # os.cpu_count() returns None in some cgroup-restricted
+                # containers — int(None * 0.9) crashes with TypeError. Fall
+                # back to 1 worker in that case rather than crashing the
+                # eval pipeline.
+                num_workers=min(8, max(1, int((os.cpu_count() or 1) * 0.9))),
             )
             scores = sort_and_round_scores(config.task, [em, sm, fm, mae, mse, wfm, hce, mba, biou])
             for idx_score, score in enumerate(scores):
@@ -67,7 +71,9 @@ if __name__ == '__main__':
     try:
         args.model_lst = [m for m in sorted(os.listdir(args.pred_root), key=lambda x: int(x.split('epoch_')[-1].split('-')[0]), reverse=True) if int(m.split('epoch_')[-1].split('-')[0]) % 1 == 0]
     except Exception as e:
-        print(f"Exception: {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        tb = e.__traceback__
+        line = tb.tb_lineno if tb is not None else '?'
+        print(f"Exception: {type(e).__name__} at line {line} of {__file__}: {e}")
         args.model_lst = [m for m in sorted(os.listdir(args.pred_root))]
 
     do_eval(args)
