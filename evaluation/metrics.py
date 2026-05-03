@@ -100,18 +100,35 @@ def process_metrics_single(data, measures, metrics):
     if 'WF' in metrics:
         measures['WF'].step(pred=pred_ary, gt=gt_ary)
     if 'HCE' in metrics:
-        # HCE需要特殊处理
         ske_path = gt_path.replace('/gt/', '/ske/')
         if os.path.exists(ske_path):
             ske_ary = cv2.imread(ske_path, cv2.IMREAD_GRAYSCALE)
             ske_ary = ske_ary > 128
         else:
             ske_ary = skeletonize(gt_ary > 128)
-            ske_save_dir = os.path.join(*ske_path.split(os.sep)[:-1])
-            if ske_path[0] == os.sep:
-                ske_save_dir = os.sep + ske_save_dir
+            ske_save_dir = os.path.dirname(ske_path)
             os.makedirs(ske_save_dir, exist_ok=True)
-            cv2.imwrite(ske_path, ske_ary.astype(np.uint8) * 255)
+            # process_metrics_batch calls this from a ThreadPoolExecutor —
+            # multiple workers can race on cv2.imwrite to the same path.
+            # cv2.imwrite isn't atomic; readers see partial files.
+            # Write to a unique tempfile then atomic-rename. Skeleton is
+            # deterministic from GT so concurrent renames are byte-equivalent.
+            import tempfile
+            fd, tmp_path = tempfile.mkstemp(
+                dir=ske_save_dir, prefix='.ske_', suffix='.png'
+            )
+            os.close(fd)
+            try:
+                cv2.imwrite(tmp_path, ske_ary.astype(np.uint8) * 255)
+                os.replace(tmp_path, ske_path)
+            except Exception:
+                # Best-effort cleanup; the next eval run regenerates.
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                raise
         measures['HCE'].step(pred=pred_ary, gt=gt_ary, gt_ske=ske_ary)
     if 'MBA' in metrics:
         measures['MBA'].step(pred=pred_ary, gt=gt_ary)
@@ -876,31 +893,12 @@ class HCEMeasure(object):
 class MBAMeasure(object):
     def __init__(self):
         self.bas = []
-        self.all_h = 0
-        self.all_w = 0
-        self.all_max = 0
 
     def step(self, pred: np.ndarray, gt: np.ndarray):
-        # pred, gt = _prepare_data(pred, gt)
-
-        refined = gt.copy()
-
-        rmin = cmin = 0
-        rmax, cmax = gt.shape
-
-        self.all_h += rmax
-        self.all_w += cmax
-        self.all_max += max(rmax, cmax)
-
-        refined_h, refined_w = refined.shape
-        if refined_h != cmax:
-            refined = np.array(Image.fromarray(pred).resize((cmax, rmax), Image.BILINEAR))
-
-        if not(gt.sum() < 32*32):
-            if not((cmax==cmin) or (rmax==rmin)):
-                class_refined_prob = np.array(Image.fromarray(pred).resize((cmax-cmin, rmax-rmin), Image.BILINEAR))
-                refined[rmin:rmax, cmin:cmax] = class_refined_prob
-
+        # The previous implementation built a `refined` and `class_refined_prob`
+        # array, plus all_h / all_w / all_max counters — none of which were
+        # ever read after assignment. cal_ba is computed on (pred, gt)
+        # directly. Dead code removed for clarity.
         pred = pred > 128
         gt = gt > 128
 
