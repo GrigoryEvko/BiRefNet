@@ -43,20 +43,37 @@ def _check_state_dict_under_test():
 
 # ------------------------------------------------------ check_state_dict bug
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "utils.check_state_dict only strips one prefix per pass and uses the "
-        "order ['module.', '_orig_mod.']. A key like '_orig_mod.module.X' that "
-        "appears after compile+DDP keeps the inner 'module.' un-stripped."
-    ),
-)
 def test_check_state_dict_strips_nested_prefixes_in_either_order():
+    """Regression: '_orig_mod.module.X' (compile+DDP) and 'module._orig_mod.X'
+    must both reduce to 'X' regardless of prefix list order."""
     check_state_dict = _check_state_dict_under_test()
-    sd = {"_orig_mod.module.layer.weight": object(), "module._orig_mod.layer.bias": object()}
-    out = check_state_dict(dict(sd))  # function mutates in place
+    sd = {"_orig_mod.module.layer.weight": 1, "module._orig_mod.layer.bias": 2}
+    out = check_state_dict(dict(sd))
     assert "layer.weight" in out
     assert "layer.bias" in out
+
+
+def test_check_state_dict_raises_on_collision():
+    """Regression: silent overwrite when both prefixed and bare keys exist."""
+    check_state_dict = _check_state_dict_under_test()
+    sd = {"module.weight": 1, "weight": 2}
+    with pytest.raises(ValueError, match="collision"):
+        check_state_dict(dict(sd))
+
+
+def test_check_state_dict_handles_torch_tensors():
+    """Real-world: torch.save objects are tensors, not Python ints."""
+    import torch
+    check_state_dict = _check_state_dict_under_test()
+    sd = {
+        "_orig_mod.layer.weight": torch.zeros(2),
+        "module.layer.bias": torch.zeros(3),
+        "layer.gamma": torch.ones(1),
+    }
+    out = check_state_dict(dict(sd))
+    assert torch.equal(out["layer.weight"], torch.zeros(2))
+    assert torch.equal(out["layer.bias"], torch.zeros(3))
+    assert torch.equal(out["layer.gamma"], torch.ones(1))
 
 
 def test_check_state_dict_handles_single_prefix():
