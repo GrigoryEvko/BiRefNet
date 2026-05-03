@@ -26,13 +26,37 @@ def path_to_image(path, size=(1024, 1024), color_type=['rgb', 'gray'][0]):
 
 
 
-def check_state_dict(state_dict, unwanted_prefixes=['module.', '_orig_mod.']):
-    for k, v in list(state_dict.items()):
-        prefix_length = 0
-        for unwanted_prefix in unwanted_prefixes:
-            if k[prefix_length:].startswith(unwanted_prefix):
-                prefix_length += len(unwanted_prefix)
-        state_dict[k[prefix_length:]] = state_dict.pop(k)
+def check_state_dict(state_dict, unwanted_prefixes=('module.', '_orig_mod.')):
+    """Strip wrapper prefixes that DDP / torch.compile add to state-dict keys.
+
+    Repeatedly strips any matching prefix until none remains, so nested
+    combinations like '_orig_mod.module.layer' (compile + DDP) collapse to
+    'layer'. Raises if stripping would silently overwrite an existing key.
+    """
+    if not unwanted_prefixes:
+        return state_dict
+    prefixes = tuple(unwanted_prefixes)
+    new_state_dict = {}
+    for k in list(state_dict.keys()):
+        new_k = k
+        # strip while any prefix still matches; longest-first so order is irrelevant
+        while True:
+            stripped = False
+            for p in sorted(prefixes, key=len, reverse=True):
+                if new_k.startswith(p):
+                    new_k = new_k[len(p):]
+                    stripped = True
+                    break
+            if not stripped:
+                break
+        if new_k in new_state_dict:
+            raise ValueError(
+                f"check_state_dict: prefix-strip collision — both {k!r} and "
+                f"another key map to {new_k!r}; refusing to silently drop a value."
+            )
+        new_state_dict[new_k] = state_dict[k]
+    state_dict.clear()
+    state_dict.update(new_state_dict)
     return state_dict
 
 
