@@ -77,6 +77,20 @@ class BiRefNet(
                 if 'bb.' in key and 'refiner.' not in key:
                     value.requires_grad = False
 
+    def train(self, mode: bool = True):
+        """Override train() so a frozen backbone stays in eval mode.
+
+        requires_grad=False stops gradient updates but does NOT prevent
+        BatchNorm running_mean / running_var (which are buffers, not
+        parameters) from being updated during a training-mode forward pass.
+        For ResNet50/VGG16 backbones with freeze_bb=True, that drift
+        silently corrupted the pretrained stats over training.
+        """
+        super().train(mode)
+        if mode and self.config.freeze_bb:
+            self.bb.eval()
+        return self
+
     def _run_backbone(self, x):
         """Run the backbone with the right call sequence for both conv-based
         (vgg/resnet, exposed as conv1..conv4 attributes) and feature-pyramid
