@@ -70,6 +70,11 @@ def main(args):
     else:
         print('Undefined model: {}.'.format(config.model))
         return None
+    # Move the model to the target device once. The per-checkpoint loop
+    # below only swaps weights via load_state_dict — the parameter tensors
+    # stay on `device`, so re-calling `.to(device)` every iteration was a
+    # no-op that still walked every parameter.
+    model = model.to(device)
     def _epoch_of(path):
         # 'foo/epoch_42.pth' → 42. Tolerate stems whose last char is in
         # {'.', 'p', 't', 'h'} which the previous rstrip('.pth') corrupted.
@@ -112,10 +117,11 @@ def main(args):
             # `--step` flag, which we don't have here. So just iterate every
             # checkpoint, which is what was happening anyway.
             print('\tInferencing {}...'.format(weights))
-            state_dict = torch.load(weights, map_location='cpu', weights_only=True)
+            # map_location=device drops the CPU staging buffer entirely on
+            # CUDA runs — saves a host-to-device copy per checkpoint.
+            state_dict = torch.load(weights, map_location=device, weights_only=True)
             state_dict = check_state_dict(state_dict)
             model.load_state_dict(state_dict)
-            model = model.to(device)
             stems = [os.path.splitext(w)[0] for w in weights.split(os.sep)[-2:]]
             inference(
                 model, data_loader_test=data_loader_test, pred_root=args.pred_root,
