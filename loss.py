@@ -132,8 +132,10 @@ class PixLoss(nn.Module):
         self.lambdas_pix_last = self.config.lambdas_pix_last
 
         self.criterions_last = {}
+        # bce takes logits; everything else (iou/ssim/mae/...) takes sigmoid'd preds.
+        # nn.BCELoss is autocast-unsafe in torch >= 2.x; use BCEWithLogitsLoss.
         if 'bce' in self.lambdas_pix_last and self.lambdas_pix_last['bce']:
-            self.criterions_last['bce'] = nn.BCELoss()
+            self.criterions_last['bce'] = nn.BCEWithLogitsLoss()
         if 'iou' in self.lambdas_pix_last and self.lambdas_pix_last['iou']:
             self.criterions_last['iou'] = IoULoss()
         if 'iou_patch' in self.lambdas_pix_last and self.lambdas_pix_last['iou_patch']:
@@ -151,17 +153,28 @@ class PixLoss(nn.Module):
         if 'structure' in self.lambdas_pix_last and self.lambdas_pix_last['structure']:
             self.criterions_last['structure'] = StructureLoss()
 
+    # Criteria that consume raw logits — everything else gets sigmoid'd inputs.
+    _LOGIT_CRITERIA = ('bce', 'structure')
+
     def forward(self, scaled_preds, gt, pix_loss_lambda=1.0):
         loss = 0.
         loss_dict = {}
-        for _, pred_lvl in enumerate(scaled_preds):
+        for pred_lvl in scaled_preds:
             if pred_lvl.shape != gt.shape:
-                pred_lvl = nn.functional.interpolate(pred_lvl, size=gt.shape[2:], mode='bilinear', align_corners=True)
+                pred_lvl = nn.functional.interpolate(
+                    pred_lvl, size=gt.shape[2:], mode='bilinear', align_corners=False
+                )
+            pred_sig = None  # lazy: only sigmoid if a non-logit criterion needs it
             for criterion_name, criterion in self.criterions_last.items():
-                _loss = criterion(pred_lvl.sigmoid(), gt) * self.lambdas_pix_last[criterion_name] * pix_loss_lambda
+                if criterion_name in self._LOGIT_CRITERIA:
+                    inp = pred_lvl
+                else:
+                    if pred_sig is None:
+                        pred_sig = pred_lvl.sigmoid()
+                    inp = pred_sig
+                _loss = criterion(inp, gt) * self.lambdas_pix_last[criterion_name] * pix_loss_lambda
                 loss += _loss
                 loss_dict[criterion_name] = loss_dict.get(criterion_name, 0.) + _loss.item() / len(scaled_preds)
-                # print(criterion_name, _loss.item())
         return loss, loss_dict
 
 
