@@ -433,7 +433,16 @@ class BasicLayer(nn.Module):
         mask_windows = window_partition(img_mask, self.window_size)
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float('-inf')).masked_fill(attn_mask == 0, float(0.0)).to(dtype)
+        # bf16 has no inf representation: float('-inf').to(bf16) saturates to
+        # the dtype min, and softmax over an all-min row produces NaN.
+        # finfo.min/2 stays representable, leaves headroom when added to
+        # attention scores, and still drives softmax weight to ~0.
+        neg_large = torch.finfo(dtype).min / 2.0
+        attn_mask = (
+            attn_mask.masked_fill(attn_mask != 0, neg_large)
+                     .masked_fill(attn_mask == 0, 0.0)
+                     .to(dtype)
+        )
         self._attn_mask_cache[key] = attn_mask
         return attn_mask
 
