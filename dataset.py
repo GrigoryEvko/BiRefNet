@@ -59,22 +59,37 @@ class MyData(data.Dataset):
             self.image_paths += [os.path.join(image_root, p) for p in os.listdir(image_root) if any(p.endswith(ext) for ext in valid_extensions)]
         self.label_paths = []
         for p in self.image_paths:
+            # Build the GT path by replacing the parent directory 'im' with 'gt'
+            # and trying every valid extension. The previous `p.replace('/im/',
+            # '/gt/')` corrupted any path with a repeated 'im' segment and
+            # broke on Windows separators. `os.path.splitext` is also used in
+            # place of `p[:-(len(p.split('.')[-1])+1)]`, which produced the
+            # empty string for files without an extension.
+            p_dir, p_name = os.path.split(p)
+            stem = os.path.splitext(p_name)[0]
+            parent, last = os.path.split(p_dir)
+            if last == 'im':
+                gt_dir = os.path.join(parent, 'gt')
+            else:
+                gt_dir = p_dir.replace(os.sep + 'im' + os.sep, os.sep + 'gt' + os.sep)
+            file_exists = False
             for ext in valid_extensions:
-                ## 'im' and 'gt' may need modifying
-                p_gt = p.replace('/im/', '/gt/')[:-(len(p.split('.')[-1])+1)] + ext
-                file_exists = False
+                p_gt = os.path.join(gt_dir, stem + ext)
                 if os.path.exists(p_gt):
                     self.label_paths.append(p_gt)
                     file_exists = True
                     break
             if not file_exists:
-                print('Not exists:', p_gt)
+                print('Not exists:', os.path.join(gt_dir, stem + valid_extensions[0]))
 
         if len(self.label_paths) != len(self.image_paths):
             set_image_paths = set([os.path.splitext(p.split(os.sep)[-1])[0] for p in self.image_paths])
             set_label_paths = set([os.path.splitext(p.split(os.sep)[-1])[0] for p in self.label_paths])
             print('Path diff:', set_image_paths - set_label_paths)
-            raise ValueError(f"There are different numbers of images ({len(self.label_paths)}) and labels ({len(self.image_paths)})")
+            raise ValueError(
+                f"There are different numbers of images ({len(self.image_paths)}) "
+                f"and labels ({len(self.label_paths)})"
+            )
 
         if self.load_all:
             self.images_loaded, self.labels_loaded = [], []
