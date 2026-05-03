@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Sequence, Tuple, Union, cast
@@ -10,6 +11,12 @@ import torch.nn.functional as F
 from PIL import Image
 
 from birefnet_api.buckets import aspect_bucket, fit_into_bucket, nearest_bucket
+
+# Default-OFF logger: applications that want predictor logs configure
+# logging at the root or for "birefnet_api.predictor" specifically.
+# Using getLogger means we don't interfere with pytest capture or with
+# downstream applications that already have a logging setup.
+_log = logging.getLogger(__name__)
 
 _LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
@@ -205,7 +212,7 @@ class BiRefNetPredictor:
             )
             if strict:
                 raise RuntimeError(msg + " — pass strict=False to tolerate")
-            print(f"[BiRefNetPredictor] {msg}")
+            _log.warning(msg)
         return cls(model, **kwargs)
 
     @classmethod
@@ -237,7 +244,7 @@ class BiRefNetPredictor:
             )
             if strict:
                 raise RuntimeError(msg + " — pass strict=False to tolerate")
-            print(f"[BiRefNetPredictor] {msg}")
+            _log.warning(msg)
         return cls(model, **kwargs)
 
     # --- public api --------------------------------------------------------

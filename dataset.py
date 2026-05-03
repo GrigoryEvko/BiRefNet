@@ -177,7 +177,14 @@ class MyData(data.Dataset):
             if config.dynamic_size is None:
                 image, label = self.transform_image(image), self.transform_label(label)
         else:
-            size_div_32 = (int(image.size[0] // 32 * 32), int(image.size[1] // 32 * 32))
+            # Snap each axis to the nearest /32 multiple, with a floor of 32
+            # so tiny inputs don't collapse to 0×0. The previous floor-only
+            # // 32 * 32 produced (0, 0) for any axis < 32 (PIL.resize then
+            # crashed) and silently dropped up to 31 pixels per axis on
+            # non-multiple inputs (a 1023x1024 image lost 31 cols).
+            def _snap(v: int) -> int:
+                return max(32, int(round(v / 32.0) * 32))
+            size_div_32 = (_snap(image.size[0]), _snap(image.size[1]))
             if image.size != size_div_32:
                 image = image.resize(size_div_32)
                 label = label.resize(size_div_32)

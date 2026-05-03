@@ -240,6 +240,14 @@ class Decoder(nn.Module):
             x, x1, x2, x3, x4, gdt_gt = features
         else:
             x, x1, x2, x3, x4 = features
+        # Template is floor-divided. All upstream paths (BiRefNetPredictor,
+        # dataset.py inference snap, dynamic_size sampler) enforce
+        # H, W ≡ 0 mod 32, in which case floor == ceil and the template is
+        # exact. If you call BiRefNet.forward directly with non-/32 input
+        # the pyramid-neck targets (used only with DINO/ViT backbones) may
+        # be off by ±1 pixel vs. what the backbone produced — F.interpolate
+        # below resamples to the template anyway, so this only loses ~1px
+        # of geometric fidelity, never crashes.
         size_x1_to_x4_template = [(x.shape[2] // (2 ** i), x.shape[3] // (2 ** i)) for i in (2, 3, 4, 5)]
         if self.use_pyramid_neck:
             x1 = F.interpolate(x1, size=size_x1_to_x4_template[0], mode='bilinear', align_corners=self._ac)
