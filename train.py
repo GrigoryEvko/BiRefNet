@@ -151,7 +151,13 @@ def init_models_optimizers(epochs, to_be_distributed):
         else:
             model = model.to(device)
     if config.compile:
-        model = torch.compile(model, mode=['default', 'reduce-overhead', 'max-autotune'][0])
+        # 'max-autotune-no-cudagraphs' adds Triton kernel autotuning without
+        # the cudagraphs that don't play well with DDP gradient hooks or
+        # dynamic_size. 'default' is the safe fallback. 'reduce-overhead' /
+        # 'max-autotune' use cudagraphs and need static shapes — wrong for
+        # training. Picked via getattr so existing configs keep working.
+        compile_mode = getattr(config, 'compile_mode', 'max-autotune-no-cudagraphs')
+        model = torch.compile(model, mode=compile_mode)
     if config.precisionHigh:
         torch.set_float32_matmul_precision('high')
 
