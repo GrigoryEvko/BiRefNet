@@ -85,20 +85,43 @@ class StructureLoss(torch.nn.Module):
 
 
 class PatchIoULoss(torch.nn.Module):
+    """Tile-IoU loss over non-overlapping 64×64 patches.
+
+    NOTE: the previous implementation iterated `range(0, target.shape[0], 64)`
+    and `range(0, target.shape[1], 64)` — i.e. over the batch and channel
+    dims, not H/W. With B<64 (the common case), only the top-left 64×64
+    tile of each prediction was scored. The lambda for this loss is 0 in
+    every default config, so the regression went unnoticed. The vectorized
+    rewrite below tiles H and W as the docstring intended; if anyone had
+    `iou_patch > 0` set, their loss values will change.
+    """
     def __init__(self):
         super(PatchIoULoss, self).__init__()
         self.iou_loss = IoULoss()
 
     def forward(self, pred, target):
-        win_y, win_x = 64, 64
-        iou_loss = 0.
-        for anchor_y in range(0, target.shape[0], win_y):
-            for anchor_x in range(0, target.shape[1], win_y):
-                patch_pred = pred[:, :, anchor_y:anchor_y+win_y, anchor_x:anchor_x+win_x]
-                patch_target = target[:, :, anchor_y:anchor_y+win_y, anchor_x:anchor_x+win_x]
-                patch_iou_loss = self.iou_loss(patch_pred, patch_target)
-                iou_loss += patch_iou_loss
-        return iou_loss
+        win = 64
+        B, C, H, W = pred.shape
+        pad_h = (-H) % win
+        pad_w = (-W) % win
+        if pad_h or pad_w:
+            pred = F.pad(pred, (0, pad_w, 0, pad_h), mode='replicate')
+            target = F.pad(target, (0, pad_w, 0, pad_h), mode='replicate')
+        Hp, Wp = pred.shape[-2], pred.shape[-1]
+        Hbar = Hp // win
+        Wbar = Wp // win
+        # (B, C, H, W) → (B, C, Hbar, win, Wbar, win) → (B, Hbar, Wbar, C, win, win)
+        # → (B*Hbar*Wbar, C, win, win). IoULoss sums (1-IoU) across the leading
+        # dim, so the return is the same scalar the docstring promised.
+        pred_tiles = (pred
+            .reshape(B, C, Hbar, win, Wbar, win)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(B * Hbar * Wbar, C, win, win))
+        target_tiles = (target
+            .reshape(B, C, Hbar, win, Wbar, win)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(B * Hbar * Wbar, C, win, win))
+        return self.iou_loss(pred_tiles, target_tiles)
 
 
 class ThrReg_loss(torch.nn.Module):
