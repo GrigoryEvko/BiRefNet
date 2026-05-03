@@ -57,17 +57,39 @@ def _np_to_uint8(arr: np.ndarray) -> np.ndarray:
     raise TypeError(f"unsupported numpy dtype: {arr.dtype}")
 
 
-def _load_pil(image: ImageInput) -> Image.Image:
+def _check_pixel_budget(h: int, w: int, max_pixels: Optional[int]) -> None:
+    """Raise if the (h, w) area exceeds the budget — decompression-bomb guard."""
+    if max_pixels is None:
+        return
+    area = int(h) * int(w)
+    if area > max_pixels:
+        raise ValueError(
+            f"Input image dimensions {w}x{h} ({area:,} pixels) exceed "
+            f"max_pixels={max_pixels:,}. This guard prevents decompression-bomb "
+            f"attacks. Pass max_pixels=None at predictor construction (or a larger "
+            f"cap) if the input is trusted."
+        )
+
+
+def _load_pil(image: ImageInput, max_pixels: Optional[int] = None) -> Image.Image:
     if isinstance(image, (str, os.PathLike)):
         # Use a context manager so the file handle is released; .copy()
         # detaches the pixel data so we can keep using it after the file closes.
+        # Image.open() is lazy — only the header is read until .load(), so
+        # we can validate dimensions before paying the decompress cost.
         with Image.open(os.fspath(image)) as fp:
+            w, h = fp.size
+            _check_pixel_budget(h, w, max_pixels)
             fp.load()
             return fp.copy()
     if isinstance(image, Image.Image):
+        w, h = image.size
+        _check_pixel_budget(h, w, max_pixels)
         return image
     if isinstance(image, np.ndarray):
         arr = image
+        if arr.ndim >= 2:
+            _check_pixel_budget(arr.shape[0], arr.shape[1], max_pixels)
         if arr.ndim == 2:
             arr = _np_to_uint8(arr)
             return Image.fromarray(arr, mode="L").convert("RGB")
@@ -83,11 +105,14 @@ def _load_pil(image: ImageInput) -> Image.Image:
             t = t.squeeze(0)
         if t.ndim != 3:
             raise ValueError(f"unsupported tensor shape {tuple(t.shape)}")
+        # Defer pixel-budget check to after CHW->HWC normalization.
         # CHW → HWC. Heuristic: if dim 0 looks like channels (1/3/4) AND the
         # last dim does NOT, permute. Symmetric ambiguous cases (3×3×H) bias
         # toward CHW because deep-learning code overwhelmingly produces that.
         if t.shape[0] in (1, 3, 4) and t.shape[-1] not in (1, 3, 4):
             t = t.permute(1, 2, 0)
+        # Now t is HWC — check budget before any conversion work.
+        _check_pixel_budget(t.shape[0], t.shape[1], max_pixels)
         if t.shape[-1] == 4:
             t = t[..., :3]
         if t.shape[-1] == 1:
@@ -148,7 +173,15 @@ class BiRefNetPredictor:
         compile_mode: str = "reduce-overhead",
         channels_last: bool = True,
         buckets: Optional[Sequence[Tuple[int, int]]] = None,
+        max_pixels: Optional[int] = 200_000_000,
     ):
+        """
+        max_pixels: decompression-bomb guard. Inputs whose H*W exceeds this
+            cap are rejected before the pixel data is decoded. Default
+            200_000_000 (~14000² or 12K×16K) — large enough for the user's
+            12K cutout workflow, small enough to block a 50K malicious
+            upload. Pass None to disable for trusted inputs only.
+        """
         self.device = self._resolve_device(device)
         self.amp_dtype = self._resolve_dtype(dtype)
         self.max_edge = int(max_edge)
@@ -158,6 +191,7 @@ class BiRefNetPredictor:
         self.buckets: Optional[List[Tuple[int, int]]] = (
             [(int(b[0]), int(b[1])) for b in buckets] if buckets else None
         )
+        self.max_pixels = int(max_pixels) if max_pixels is not None else None
 
         model = model.eval().to(self.device)
         if self.channels_last:
@@ -261,7 +295,7 @@ class BiRefNetPredictor:
         Returns a torch.Tensor of shape (H, W) in [0, 1] (default), or a PIL 'L' image.
         """
         max_edge = self.max_edge if max_edge is None else int(max_edge)
-        pil = _load_pil(image)
+        pil = _load_pil(image, max_pixels=self.max_pixels)
         if pil.mode != "RGB":
             pil = pil.convert("RGB")
         orig_w, orig_h = pil.size  # PIL is (w, h)
@@ -307,7 +341,7 @@ class BiRefNetPredictor:
         max_edge = self.max_edge if max_edge is None else int(max_edge)
         items = []
         for img in images:
-            pil = _load_pil(img)
+            pil = _load_pil(img, max_pixels=self.max_pixels)
             if pil.mode != "RGB":
                 pil = pil.convert("RGB")
             ow, oh = pil.size
@@ -374,7 +408,7 @@ class BiRefNetPredictor:
         fg_radius: int = 90,
     ) -> Image.Image:
         """Return an RGBA PIL image at the original resolution with mask as alpha."""
-        pil = _load_pil(image)
+        pil = _load_pil(image, max_pixels=self.max_pixels)
         if pil.mode not in ("RGB", "RGBA"):
             pil = pil.convert("RGB")
         rgb_pil = pil.convert("RGB")
