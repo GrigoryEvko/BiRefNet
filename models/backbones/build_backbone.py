@@ -21,7 +21,14 @@ def build_backbone(bb_name, pretrained=True, params_settings=''):
         bb_net = list(resnet50(weights=ResNet50_Weights.DEFAULT if pretrained else None).children())
         bb = nn.Sequential(OrderedDict({'conv1': nn.Sequential(*bb_net[0:4], bb_net[4]), 'conv2': bb_net[5], 'conv3': bb_net[6], 'conv4': bb_net[7]}))
     else:
-        bb = eval('{}({})'.format(bb_name, params_settings))
+        # For DINO backbones, pass dynamic_img_size=False when training/eval
+        # uses a fixed input shape — saves a position-embedding interpolation
+        # per forward. config.dynamic_size is None means fixed shape.
+        if 'dino_v3' in bb_name and not params_settings:
+            dyn = config.dynamic_size is not None
+            bb = eval(bb_name)(dynamic_img_size=dyn)
+        else:
+            bb = eval('{}({})'.format(bb_name, params_settings))
         if pretrained:
             bb = load_weights(bb, bb_name)
     return bb
