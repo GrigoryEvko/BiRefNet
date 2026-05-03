@@ -118,7 +118,7 @@ def init_models_optimizers(epochs, to_be_distributed):
             state_dict = check_state_dict(state_dict)
             model.load_state_dict(state_dict)
             global epoch_st
-            epoch_st = int(args.resume.rstrip('.pth').split('epoch_')[-1]) + 1
+            epoch_st = int(os.path.splitext(args.resume)[0].split('epoch_')[-1]) + 1
         else:
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
     if not args.use_accelerate:
@@ -163,7 +163,10 @@ class Trainer:
         # Setting Losses
         self.pix_loss = PixLoss()
         self.cls_loss = ClsLoss()
-        
+        # Snapshot the original lambdas so finetune-window adjustments are
+        # absolute (not cumulative across epochs).
+        self._pix_lambdas_orig = dict(self.pix_loss.lambdas_pix_last)
+
         # Others
         self.loss_log = AverageMeter()
 
@@ -217,16 +220,22 @@ class Trainer:
         global logger_loss_idx
         self.model.train()
         self.loss_dict = {}
+        # Apply finetune-window lambda overrides as absolute multipliers of the
+        # original snapshot. Doing it via `*= 0.9` on the live dict (the old code)
+        # decayed geometrically every epoch — after 20 epochs `iou` was 0.5**20 of
+        # its starting value, not 0.5x.
         if epoch > args.epochs + config.finetune_last_epochs:
+            orig = self._pix_lambdas_orig
+            current = self.pix_loss.lambdas_pix_last
             if config.task == 'Matting':
-                self.pix_loss.lambdas_pix_last['mae'] *= 1
-                self.pix_loss.lambdas_pix_last['mse'] *= 0.9
-                self.pix_loss.lambdas_pix_last['ssim'] *= 0.9
+                current['mae'] = orig['mae'] * 1.0
+                current['mse'] = orig['mse'] * 0.9
+                current['ssim'] = orig['ssim'] * 0.9
             else:
-                self.pix_loss.lambdas_pix_last['bce'] *= 0
-                self.pix_loss.lambdas_pix_last['ssim'] *= 1
-                self.pix_loss.lambdas_pix_last['iou'] *= 0.5
-                self.pix_loss.lambdas_pix_last['mae'] *= 0.9
+                current['bce'] = orig['bce'] * 0.0
+                current['ssim'] = orig['ssim'] * 1.0
+                current['iou'] = orig['iou'] * 0.5
+                current['mae'] = orig['mae'] * 0.9
 
         for batch_idx, batch in enumerate(self.train_loader):
             # with nullcontext if not args.use_accelerate or accelerator.gradient_accumulation_steps <= 1 else accelerator.accumulate(self.model):
