@@ -159,10 +159,11 @@ class PixLoss(nn.Module):
     def forward(self, scaled_preds, gt, pix_loss_lambda=1.0):
         loss = 0.
         loss_dict = {}
+        ac = bool(getattr(self.config, 'align_corners', True))
         for pred_lvl in scaled_preds:
             if pred_lvl.shape != gt.shape:
                 pred_lvl = nn.functional.interpolate(
-                    pred_lvl, size=gt.shape[2:], mode='bilinear', align_corners=False
+                    pred_lvl, size=gt.shape[2:], mode='bilinear', align_corners=ac
                 )
             pred_sig = None  # lazy: only sigmoid if a non-logit criterion needs it
             for criterion_name, criterion in self.criterions_last.items():
