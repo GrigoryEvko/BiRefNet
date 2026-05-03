@@ -153,18 +153,55 @@ def test_BCEWithLogits_under_bf16_autocast_is_safe():
     assert pred.grad is not None
 
 
-# ----------------------------------------- multi_scl_ipt='add' branch crash sketch
+# ----------------------------------------- multi_scl_ipt='add' branch with vgg16
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "models/birefnet.py:80-85 — the 'add' branch unconditionally calls "
-        "self.bb(x_pyramid) instead of the conv1..conv4 special case used in "
-        "the 'cat' branch above; for vgg16/resnet50 that AttributeError would "
-        "fire. We can't import BiRefNet here without cv2/kornia, so we simply "
-        "fail to demonstrate intent and let a maintainer un-xfail this test "
-        "once the upstream bug is fixed."
-    ),
-)
 def test_mul_scl_ipt_add_branch_handles_vgg_resnet():
-    pytest.fail("placeholder — see docstring")
+    """Real exercise: with mul_scl_ipt='add' + bb='vgg16', the previous code
+    called self.bb(x_pyramid) blindly and crashed with AttributeError because
+    vgg16 exposes conv1..conv4 instead of being directly callable. Now goes
+    through _run_backbone which dispatches per-backbone.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("kornia")
+    pytest.importorskip("cv2")
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    import torch
+    import config as _config
+
+    orig_init = _config.Config.__init__
+    def _patched(self):
+        try:
+            orig_init(self)
+        except FileNotFoundError:
+            pass
+        # Override after default init to guarantee the path under test.
+        self.bb = 'vgg16'
+        self.mul_scl_ipt = 'add'
+        # vgg16's lateral channels — restate so the model picks them up.
+        # mul_scl_ipt='add' keeps channels as-is (no x2 doubling).
+        self.lateral_channels_in_collection = [512, 512, 256, 128]
+        self.cxt = self.lateral_channels_in_collection[1:][::-1][-self.cxt_num:] if self.cxt_num else []
+
+    _config.Config.__init__ = _patched
+    # Drop cached imports so the swap takes effect.
+    for mod in ("models.birefnet", "models.backbones.build_backbone"):
+        sys.modules.pop(mod, None)
+    try:
+        from models.birefnet import BiRefNet
+        model = BiRefNet(bb_pretrained=False).eval()
+        # vgg16 max-pools 5x → /32 downsample. 96 is divisible by 32 and small.
+        x = torch.zeros(1, 3, 96, 96)
+        with torch.no_grad():
+            out = model(x)
+        # eval mode returns the list of scaled_preds.
+        assert isinstance(out, list)
+        assert out, "model returned empty list"
+        last = out[-1]
+        assert torch.is_tensor(last)
+        assert torch.all(torch.isfinite(last))
+    finally:
+        _config.Config.__init__ = orig_init
+        for mod in ("models.birefnet", "models.backbones.build_backbone"):
+            sys.modules.pop(mod, None)
