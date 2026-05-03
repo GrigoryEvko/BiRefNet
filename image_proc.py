@@ -126,16 +126,17 @@ def cv_random_flip(img, label):
 
 
 def random_crop(image, label):
-    border = 30
-    image_width = image.size[0]
-    image_height = image.size[1]
-    border = int(min(image_width, image_height) * 0.1)
-    crop_win_width = np.random.randint(image_width - border, image_width)
-    crop_win_height = np.random.randint(image_height - border, image_height)
-    random_region = (
-        (image_width - crop_win_width) >> 1, (image_height - crop_win_height) >> 1, (image_width + crop_win_width) >> 1,
-        (image_height + crop_win_height) >> 1)
-    return image.crop(random_region), label.crop(random_region)
+    """Crop a random window of slightly-smaller-than-original size at a random
+    position. The previous implementation positioned the crop dead center via
+    `(W - crop_w) >> 1`, so the augmentation provided no spatial jitter."""
+    image_width, image_height = image.size
+    border = max(1, int(min(image_width, image_height) * 0.1))
+    crop_win_width = np.random.randint(image_width - border, image_width + 1)
+    crop_win_height = np.random.randint(image_height - border, image_height + 1)
+    left = np.random.randint(0, image_width - crop_win_width + 1)
+    top = np.random.randint(0, image_height - crop_win_height + 1)
+    box = (left, top, left + crop_win_width, top + crop_win_height)
+    return image.crop(box), label.crop(box)
 
 
 def random_rotate(image, label, angle=15):
