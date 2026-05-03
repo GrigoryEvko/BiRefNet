@@ -55,3 +55,23 @@ def test_image2patches_handles_image_smaller_than_ref():
                         transformation='b c (hg h) (wg w) -> b (c hg wg) h w')
     # grid_h = max(1, 4//8) = 1; rearrange becomes a no-op shape-wise.
     assert out.ndim == 4
+
+
+def test_image2patches_default_transformation_with_remainder():
+    """The function's default transformation 'b c (hg h) (wg w) -> (b hg wg) c h w'
+    must also pad correctly. Different output layout (batched-along-grid
+    instead of channel-along-grid), but the same divisibility constraint.
+    """
+    from models.birefnet import image2patches
+    image = torch.zeros(1, 3, 17, 17)
+    out = image2patches(image, grid_h=4, grid_w=4)  # uses default transformation
+    # After replicate-pad to 20×20, default transformation gives
+    # (b * hg * wg) c h w = (1*4*4, 3, 5, 5) = (16, 3, 5, 5).
+    assert out.shape == (16, 3, 5, 5)
+
+
+def test_image2patches_default_transformation_no_pad_when_divisible():
+    from models.birefnet import image2patches
+    image = torch.zeros(1, 3, 16, 16)
+    out = image2patches(image, grid_h=4, grid_w=4)  # default transformation
+    assert out.shape == (16, 3, 4, 4)
