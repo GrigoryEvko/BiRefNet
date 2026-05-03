@@ -65,6 +65,34 @@ def test_np_to_uint8_int16_rescales_not_truncates():
     assert out[0, 2] == 255
 
 
+def test_np_to_uint8_uniform_uint16_keeps_value():
+    """Uniform-valued integer array must not collapse to all-zero — a uint16
+    image of all-100 is grey, not black. Previous code returned zeros."""
+    a = np.full((4, 4), 100, dtype=np.uint16)
+    out = _np_to_uint8(a)
+    assert out.dtype == np.uint8
+    assert (out == 100).all()
+
+
+def test_np_to_uint8_uniform_uint16_above_255_clips():
+    """Uniform-valued uint16 above 255 should clip rather than truncate."""
+    a = np.full((4, 4), 5000, dtype=np.uint16)
+    out = _np_to_uint8(a)
+    assert out.dtype == np.uint8
+    assert (out == 255).all()
+
+
+def test_load_pil_uniform_int_tensor_keeps_value():
+    """Uniform int CHW tensor should round-trip to a non-black PIL image."""
+    from birefnet_api.predictor import _load_pil
+    t = torch.full((3, 8, 8), 80, dtype=torch.int32)
+    pil = _load_pil(t)
+    arr = np.asarray(pil)
+    assert arr.dtype == np.uint8
+    # All channels uniform at 80 → loader must keep the value, not return zeros.
+    assert (arr == 80).all()
+
+
 # --- predict() hardening ---
 
 def test_predict_handles_float32_in_0_255_range(cpu_predictor):
