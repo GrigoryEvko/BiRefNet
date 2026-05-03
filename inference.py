@@ -2,7 +2,7 @@ import os
 import argparse
 from glob import glob
 from tqdm import tqdm
-import cv2
+from PIL import Image
 import torch
 from contextlib import nullcontext
 
@@ -41,9 +41,14 @@ def inference(model, data_loader_test, pred_root, method, testset, device=0):
         os.makedirs(os.path.join(pred_root, method, testset), exist_ok=True)
 
         for idx_sample in range(scaled_preds.shape[0]):
+            # PIL.Image.open() reads only the header to get .size, so we
+            # avoid decoding the entire label PNG just for shape (the old
+            # cv2.imread().shape pulled the full pixel data).
+            with Image.open(label_paths[idx_sample]) as _label_pil:
+                target_w, target_h = _label_pil.size
             res = torch.nn.functional.interpolate(
                 scaled_preds[idx_sample].unsqueeze(0),
-                size=cv2.imread(label_paths[idx_sample], cv2.IMREAD_GRAYSCALE).shape[:2],
+                size=(target_h, target_w),
                 mode='bilinear',
                 align_corners=bool(getattr(config, 'align_corners', True))
             )
@@ -84,7 +89,10 @@ def main(args):
         else:
             data_size = [int(l) for l in args.resolution.split('x')]
     except Exception as e:
-        print(f"Exception: {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        # e.__traceback__ can be None on bare exceptions (no raise frame).
+        tb = e.__traceback__
+        line = tb.tb_lineno if tb is not None else '?'
+        print(f"Exception: {type(e).__name__} at line {line} of {__file__}: {e}")
         # default as the config.size.
         data_size = config.size
 
