@@ -17,7 +17,7 @@ _TYPE = np.float64
 
 def load_single_image_pair(args):
     gt_path, pred_path, idx = args
-    
+    pred = pred_path  # bound early so the except handler always has a value
     try:
         pred = pred_path[:-4] + '.png'
         valid_extensions = ['.png', '.jpg', '.PNG', '.JPG', '.JPEG']
@@ -35,7 +35,15 @@ def load_single_image_pair(args):
         gt_ary = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
         pred_ary = cv2.imread(pred, cv2.IMREAD_GRAYSCALE)
 
-        if gt_ary is None or pred_ary is None:
+        # cv2.imread returns None for missing/unreadable/unsupported files —
+        # the previous code silently dropped these from the eval set, which
+        # made bad permissions or corrupt files invisible. Log loudly so the
+        # operator sees the dataset shrinking.
+        if gt_ary is None:
+            print(f'[eval] cv2.imread returned None for GT: {gt_path}')
+            return None
+        if pred_ary is None:
+            print(f'[eval] cv2.imread returned None for PRED: {pred}')
             return None
 
         pred_ary = cv2.resize(pred_ary, (gt_ary.shape[1], gt_ary.shape[0]))
@@ -48,7 +56,10 @@ def load_single_image_pair(args):
             'pred_path': pred
         }
     except Exception as e:
-        print(f"Error loading {gt_path}: {e}")
+        # Include both paths and the exception type, not just the message.
+        # Previous output ("Error loading {gt}: {e}") swallowed the pred path
+        # and the exception class, hiding e.g. PermissionError vs OSError.
+        print(f'[eval] {type(e).__name__} loading gt={gt_path!r} pred={pred!r}: {e}')
         return None
 
 

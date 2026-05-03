@@ -98,9 +98,13 @@ def main(args):
 
     for testset in args.testsets.split('+'):
         print('>>>> Testset: {}...'.format(testset))
+        # pin_memory only helps CPU→GPU transfers. With CUDA disabled (or
+        # when running on CPU) it costs page-locked memory for no benefit
+        # and can warn loudly.
+        _pin = torch.cuda.is_available() and str(config.device) != 'cpu'
         data_loader_test = torch.utils.data.DataLoader(
             dataset=MyData(testset, data_size=data_size, is_train=False),
-            batch_size=config.batch_size_valid, shuffle=False, num_workers=config.num_workers, pin_memory=True
+            batch_size=config.batch_size_valid, shuffle=False, num_workers=config.num_workers, pin_memory=_pin
         )
         for weights in weights_lst:
             # The previous `% 1 != 0` filter was always False (dead code). The
