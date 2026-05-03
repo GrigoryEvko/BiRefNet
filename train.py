@@ -156,7 +156,9 @@ class Trainer:
         if args.use_accelerate:
             self.train_loader, self.model, self.optimizer = accelerator.prepare(self.train_loader, self.model, self.optimizer)
         if config.out_ref:
-            self.criterion_gdt = nn.BCELoss()
+            # BCELoss is autocast-unsafe (raises in torch >= 2.x under bf16/fp16);
+            # gdt prediction is a raw logit, so feed logits to BCEWithLogitsLoss.
+            self.criterion_gdt = nn.BCEWithLogitsLoss()
 
         # Setting Losses
         self.pix_loss = PixLoss()
@@ -178,11 +180,16 @@ class Trainer:
         scaled_preds, class_preds_lst = self.model(inputs)
         if config.out_ref:
             (outs_gdt_pred, outs_gdt_label), scaled_preds = scaled_preds
-            for _idx, (_gdt_pred, _gdt_label) in enumerate(zip(outs_gdt_pred, outs_gdt_label)):
-                _gdt_pred = nn.functional.interpolate(_gdt_pred, size=_gdt_label.shape[2:], mode='bilinear', align_corners=True).sigmoid()
+            loss_gdt = 0.
+            for _gdt_pred, _gdt_label in zip(outs_gdt_pred, outs_gdt_label):
+                # _gdt_pred is raw logits → feed straight to BCEWithLogitsLoss.
+                # _gdt_label is laplacian(input)*mask_logit; sigmoid gives a soft
+                # target in (0,1) that BCEWithLogitsLoss accepts directly.
+                _gdt_pred = nn.functional.interpolate(
+                    _gdt_pred, size=_gdt_label.shape[2:], mode='bilinear', align_corners=False
+                )
                 _gdt_label = _gdt_label.sigmoid()
-                loss_gdt = self.criterion_gdt(_gdt_pred, _gdt_label) if _idx == 0 else self.criterion_gdt(_gdt_pred, _gdt_label) + loss_gdt
-            # self.loss_dict['loss_gdt'] = loss_gdt.item()
+                loss_gdt = loss_gdt + self.criterion_gdt(_gdt_pred, _gdt_label)
         if None in class_preds_lst:
             loss_cls = 0.
         else:
