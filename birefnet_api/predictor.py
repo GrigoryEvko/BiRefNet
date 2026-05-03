@@ -33,11 +33,14 @@ def _np_to_uint8(arr: np.ndarray) -> np.ndarray:
     if arr.dtype == np.uint8:
         return arr
     if np.issubdtype(arr.dtype, np.integer):
-        # rescale into [0, 255] using observed range
+        # Rescale into [0, 255] using observed range. For a uniform-valued
+        # array (a_max == a_min) just clip-cast the raw value rather than
+        # collapsing it to zero — a uint16 image of all-100 should stay
+        # all-100 after the cast, not become all-0.
         a_min = float(arr.min())
         a_max = float(arr.max())
         if a_max <= a_min:
-            return np.zeros_like(arr, dtype=np.uint8)
+            return np.clip(arr, 0, 255).astype(np.uint8)
         return ((arr.astype(np.float64) - a_min) * (255.0 / (a_max - a_min))).astype(np.uint8)
     if np.issubdtype(arr.dtype, np.floating):
         a_max = float(np.nanmax(arr)) if arr.size else 0.0
@@ -90,11 +93,12 @@ def _load_pil(image: ImageInput) -> Image.Image:
                 arr = t.clamp(0, 255).to(torch.uint8).cpu().numpy()
         else:
             # Integer: rescale by observed range, don't truncate uint8 mod 256.
+            # Uniform tensor (t_max == t_min) → clip-cast raw value, not zero.
             t = t.cpu()
             t_min = int(t.min().item())
             t_max = int(t.max().item())
             if t_max <= t_min:
-                arr = np.zeros(tuple(t.shape), dtype=np.uint8)
+                arr = t.clamp(0, 255).to(torch.uint8).numpy()
             else:
                 f = (t.to(torch.float64) - t_min) * (255.0 / (t_max - t_min))
                 arr = f.clamp(0, 255).to(torch.uint8).numpy()
