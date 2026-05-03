@@ -29,17 +29,47 @@ def build_backbone(bb_name, pretrained=True, params_settings=''):
 def load_weights(model, model_name):
     save_model = torch.load(config.weights[model_name], map_location='cpu', weights_only=True)
     model_dict = model.state_dict()
-    state_dict = {k: v if v.size() == model_dict[k].size() else model_dict[k] for k, v in save_model.items() if k in model_dict.keys()}
-    # to ignore the weights with mismatched size when I modify the backbone itself.
+    state_dict, dropped = _filter_state_dict(save_model, model_dict)
     if not state_dict:
+        # Some upstream checkpoints wrap the actual state dict under a single key.
         save_model_keys = list(save_model.keys())
         sub_item = save_model_keys[0] if len(save_model_keys) == 1 else None
-        state_dict = {k: v if v.size() == model_dict[k].size() else model_dict[k] for k, v in save_model[sub_item].items() if k in model_dict.keys()}
-        if not state_dict or not sub_item:
+        if sub_item is None:
             print('Weights are not successfully loaded. Check the state dict of weights file.')
             return None
-        else:
-            print('Found correct weights in the "{}" item of loaded state_dict.'.format(sub_item))
+        state_dict, dropped = _filter_state_dict(save_model[sub_item], model_dict)
+        if not state_dict:
+            print('Weights are not successfully loaded. Check the state dict of weights file.')
+            return None
+        print('Found correct weights in the "{}" item of loaded state_dict.'.format(sub_item))
+    if dropped:
+        print(
+            "[load_weights] dropped {} keys due to shape mismatch (kept random init for those):".format(len(dropped))
+        )
+        for k, sizes in dropped[:10]:
+            print("  - {}: ckpt {} != model {}".format(k, tuple(sizes[0]), tuple(sizes[1])))
+        if len(dropped) > 10:
+            print("  ... and {} more".format(len(dropped) - 10))
     model_dict.update(state_dict)
     model.load_state_dict(model_dict)
     return model
+
+
+def _filter_state_dict(save_model, model_dict):
+    """Return (matching_state_dict, dropped_keys).
+
+    Keeps only keys that exist in the model with matching size. Logs every
+    size-mismatched key instead of silently substituting random init weights
+    (the previous behavior).
+    """
+    state_dict = {}
+    dropped = []
+    for k, v in save_model.items():
+        if k not in model_dict:
+            continue
+        target = model_dict[k]
+        if v.size() == target.size():
+            state_dict[k] = v
+        else:
+            dropped.append((k, (v.size(), target.size())))
+    return state_dict, dropped
