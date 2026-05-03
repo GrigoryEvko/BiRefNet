@@ -111,6 +111,37 @@ class WindowAttention(nn.Module):
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
+        # Cache for the gathered + cast bias used in eval. Rebuilt every forward
+        # in training because relative_position_bias_table changes each step.
+        self._rpb_cache: dict = {}
+
+    def train(self, mode: bool = True):
+        """Clear the eval-time bias cache when switching to train mode — the
+        bias_table will start changing again, so cached views go stale."""
+        if mode:
+            self._rpb_cache = {}
+        return super().train(mode)
+
+    def _relative_position_bias(self, q):
+        """Return the gathered, cast, broadcast-shaped bias for the attention.
+
+        Shape: (1, num_heads, N, N) where N = Wh*Ww. In eval mode we cache
+        per (dtype, device) — the table is fixed so the gathered tensor is too.
+        """
+        N = self.window_size[0] * self.window_size[1]
+        if self.training:
+            return self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+                N, N, -1
+            ).permute(2, 0, 1).unsqueeze(0).to(dtype=q.dtype, device=q.device)
+        key = (q.dtype, str(q.device))
+        cached = self._rpb_cache.get(key)
+        if cached is not None:
+            return cached
+        rpb = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            N, N, -1
+        ).permute(2, 0, 1).unsqueeze(0).to(dtype=q.dtype, device=q.device).contiguous()
+        self._rpb_cache[key] = rpb
+        return rpb
 
     def forward(self, x, mask=None):
         """ Forward function.
@@ -124,9 +155,7 @@ class WindowAttention(nn.Module):
 
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # [B_, H, N, Dh]
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            N, N, -1
-        ).permute(2, 0, 1).unsqueeze(0).to(dtype=q.dtype, device=q.device)
+        relative_position_bias = self._relative_position_bias(q)
         if mask is not None:
             mask = mask.to(dtype=q.dtype).unsqueeze(1)
 
