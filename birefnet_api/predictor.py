@@ -173,7 +173,21 @@ class BiRefNetPredictor:
         return cls(model, **kwargs)
 
     @classmethod
-    def from_checkpoint(cls, ckpt_path: Union[str, "os.PathLike[str]"], **kwargs) -> "BiRefNetPredictor":
+    def from_checkpoint(
+        cls,
+        ckpt_path: Union[str, "os.PathLike[str]"],
+        strict: bool = True,
+        **kwargs,
+    ) -> "BiRefNetPredictor":
+        """Load a model from a local checkpoint and wrap it in a predictor.
+
+        strict=True (default) raises on any missing/unexpected key after
+        prefix stripping — a mismatched state_dict is almost always a config
+        mismatch, and silently using random weights produces meaningless
+        predictions. Pass strict=False to tolerate mismatches; in that mode
+        the method names every mismatched key (up to 10 each direction)
+        rather than just printing the counts.
+        """
         from models.birefnet import BiRefNet
         from utils import check_state_dict
         model = BiRefNet(bb_pretrained=False)
@@ -181,8 +195,17 @@ class BiRefNetPredictor:
         sd = check_state_dict(sd)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing or unexpected:
-            # surface mismatches but don't fail outright
-            print(f"[BiRefNetPredictor] state-dict: missing={len(missing)} unexpected={len(unexpected)}")
+            preview_n = 10
+            miss_preview = ', '.join(missing[:preview_n]) + ('...' if len(missing) > preview_n else '')
+            unx_preview = ', '.join(unexpected[:preview_n]) + ('...' if len(unexpected) > preview_n else '')
+            msg = (
+                f"state-dict mismatch loading {ckpt_path!s}: "
+                f"missing={len(missing)} ({miss_preview or '-'}) "
+                f"unexpected={len(unexpected)} ({unx_preview or '-'})"
+            )
+            if strict:
+                raise RuntimeError(msg + " — pass strict=False to tolerate")
+            print(f"[BiRefNetPredictor] {msg}")
         return cls(model, **kwargs)
 
     # --- public api --------------------------------------------------------
