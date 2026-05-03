@@ -122,6 +122,18 @@ class WindowAttention(nn.Module):
             self._rpb_cache = {}
         return super().train(mode)
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Clear the eval-time bias cache when state_dict is loaded — the
+        relative_position_bias_table is about to be overwritten, and any
+        cached gathered+cast tensors derived from it are now stale.
+
+        Without this, a workflow like
+            model.eval(); model(x); model.load_state_dict(other); model(x)
+        returns biases derived from the FIRST checkpoint on the second call.
+        """
+        self._rpb_cache = {}
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def _relative_position_bias(self, q):
         """Return the gathered, cast, broadcast-shaped bias for the attention.
 

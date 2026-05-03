@@ -73,3 +73,28 @@ def test_rpb_cache_not_in_state_dict():
     attn._relative_position_bias(q)
     keys = attn.state_dict().keys()
     assert all("rpb_cache" not in k for k in keys)
+
+
+def test_rpb_cache_cleared_on_load_state_dict():
+    """The relative_position_bias_table changes when a checkpoint is loaded.
+    Cached gathered+cast tensors derived from the OLD table are now stale —
+    cache must clear so the next forward rebuilds against the new weights.
+    """
+    attn = _make_attn().eval()
+    q = torch.zeros(1, 2, 49, 4)
+    cached_first = attn._relative_position_bias(q).clone()
+
+    # Build a second module with a different bias table, copy its state.
+    attn2 = _make_attn().eval()
+    with torch.no_grad():
+        attn2.relative_position_bias_table.fill_(0.5)  # distinctive value
+    sd = attn2.state_dict()
+
+    attn.load_state_dict(sd)
+    # Cache must be empty after load_state_dict.
+    assert len(attn._rpb_cache) == 0
+    # Next forward returns bias derived from the NEW table, not the cached old one.
+    new_bias = attn._relative_position_bias(q)
+    assert not torch.allclose(new_bias, cached_first), (
+        "rpb_cache returned stale bias after load_state_dict"
+    )
