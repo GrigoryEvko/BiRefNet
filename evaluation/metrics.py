@@ -46,7 +46,10 @@ def load_single_image_pair(args):
             print(f'[eval] cv2.imread returned None for PRED: {pred}')
             return None
 
-        pred_ary = cv2.resize(pred_ary, (gt_ary.shape[1], gt_ary.shape[0]))
+        # Resize pred to GT shape with LANCZOS4 — INTER_LINEAR softens
+        # edges that the F-measure / MBA boundary metrics specifically
+        # score, biasing scores against the model.
+        pred_ary = cv2.resize(pred_ary, (gt_ary.shape[1], gt_ary.shape[0]), interpolation=cv2.INTER_LANCZOS4)
 
         return {
             'idx': idx,
@@ -282,7 +285,7 @@ def evaluator(gt_paths, pred_paths, metrics=['S', 'MAE', 'E', 'F', 'WF', 'MBA', 
             if gt_ary is None or pred_ary is None:
                 continue
                 
-            pred_ary = cv2.resize(pred_ary, (gt_ary.shape[1], gt_ary.shape[0]))
+            pred_ary = cv2.resize(pred_ary, (gt_ary.shape[1], gt_ary.shape[0]), interpolation=cv2.INTER_LANCZOS4)
 
             if 'E' in metrics:
                 measures['E'].step(pred=pred_ary, gt=gt_ary)
