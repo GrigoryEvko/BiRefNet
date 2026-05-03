@@ -1,11 +1,10 @@
 """Regression tests for dynamic_size sampling:
 
   - tuple(sorted(dynamic_size)) must NOT be applied (it swapped W/H ranges)
-  - the sampled batch shape must be the same on every DDP rank (else NCCL
-    all-reduce shape mismatch)
 
-These tests don't spin up real NCCL — they patch torch.distributed to
-simulate two ranks and verify the broadcast path is exercised.
+Each rank samples independently — DDP all-reduces gradients (parameter shape),
+not activations, so different per-rank input sizes don't trigger an all-reduce
+shape mismatch.
 """
 from __future__ import annotations
 
@@ -50,9 +49,6 @@ def test_dropped_sorted_keeps_dimension_order(monkeypatch):
     # Outputs are snapped to /32 multiples within the *original* ranges.
     assert 32 <= w <= 320, w
     assert 96 <= h <= 224, h
-    # Critical: w must come from the W range (50..300), h from the H range.
-    # Pre-fix code would sort the tuple-of-tuples lex and swap them when
-    # 50 < 100 → ((50,300),(100,200)) sorted is ((50,300),(100,200)) — same.
     # Try a case where sort would actually flip:
     dynamic_size = ((150, 300), (50, 200))
     ds = _import_dataset_with_stub_config(monkeypatch, dynamic_size)
@@ -64,49 +60,14 @@ def test_dropped_sorted_keeps_dimension_order(monkeypatch):
     assert 32 <= h <= 224, h
 
 
-def test_ddp_broadcast_path_invoked(monkeypatch):
-    """Simulate dist.is_initialized() == True with world_size==2 rank==0;
-    verify dist.broadcast is called and returns the same size both ranks."""
-    dynamic_size = ((128, 256), (128, 256))
+def test_independent_sampling_returns_div_32_multiples(monkeypatch):
+    """Sampled (W, H) are always multiples of 32 within the configured range."""
+    dynamic_size = ((128, 512), (128, 512))
     ds = _import_dataset_with_stub_config(monkeypatch, dynamic_size)
-
-    import torch.distributed as dist
-    monkeypatch.setattr(dist, "is_available", lambda: True)
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda: 0)
-
-    broadcast_calls = []
-    def fake_broadcast(tensor, src=0):
-        broadcast_calls.append((tensor.clone(), src))
-    monkeypatch.setattr(dist, "broadcast", fake_broadcast)
-
-    random.seed(42)
-    w, h = ds._sample_dynamic_size()
-    assert len(broadcast_calls) == 1
-    bcast_tensor, src = broadcast_calls[0]
-    assert src == 0
-    assert int(bcast_tensor[0].item()) == w
-    assert int(bcast_tensor[1].item()) == h
-    assert w % 32 == 0 and h % 32 == 0
-
-
-def test_non_rank_0_receives_size_from_broadcast(monkeypatch):
-    """Rank 1 starts with (0, 0) and receives the broadcast value."""
-    dynamic_size = ((128, 256), (128, 256))
-    ds = _import_dataset_with_stub_config(monkeypatch, dynamic_size)
-
-    import torch.distributed as dist
-    monkeypatch.setattr(dist, "is_available", lambda: True)
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda: 1)
-
-    def fake_broadcast(tensor, src=0):
-        # Pretend rank 0 sent (160, 224)
-        tensor[0] = 160
-        tensor[1] = 224
-    monkeypatch.setattr(dist, "broadcast", fake_broadcast)
-
-    w, h = ds._sample_dynamic_size()
-    assert (w, h) == (160, 224)
+    random.seed(123)
+    for _ in range(50):
+        w, h = ds._sample_dynamic_size()
+        assert w % 32 == 0
+        assert h % 32 == 0
+        assert 128 <= w <= 512
+        assert 128 <= h <= 512

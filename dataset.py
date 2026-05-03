@@ -195,31 +195,15 @@ class MyData(data.Dataset):
 def _sample_dynamic_size():
     """Sample a (W, H) batch size from config.dynamic_size, snapped to /32.
 
-    Under DDP each rank's DataLoader workers sit in different processes; if
-    they each call random.randint independently the collate sizes diverge,
-    NCCL all-reduce shape-mismatches, and training hangs or crashes. Rank 0
-    picks the size and broadcasts to the rest.
+    Each rank samples independently. DDP all-reduces gradients of parameter
+    shape, not activation shape, so per-rank input size divergence is fine.
+    Earlier code wrapped this in tuple(sorted(...)), which lexicographically
+    swapped the W and H ranges; removed.
     """
-    # Note: previously this dict was wrapped in `tuple(sorted(...))` which
-    # lexicographically swapped the W and H ranges when their lower bounds
-    # crossed. Removed.
     w_lo, w_hi = config.dynamic_size[0]
     h_lo, h_hi = config.dynamic_size[1]
-    import torch.distributed as dist
-    is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-    if is_dist:
-        if dist.get_rank() == 0:
-            w = random.randint(w_lo, w_hi) // 32 * 32
-            h = random.randint(h_lo, h_hi) // 32 * 32
-        else:
-            w, h = 0, 0
-        import torch
-        size_tensor = torch.tensor([w, h], dtype=torch.int64)
-        dist.broadcast(size_tensor, src=0)
-        w, h = int(size_tensor[0].item()), int(size_tensor[1].item())
-    else:
-        w = random.randint(w_lo, w_hi) // 32 * 32
-        h = random.randint(h_lo, h_hi) // 32 * 32
+    w = random.randint(w_lo, w_hi) // 32 * 32
+    h = random.randint(h_lo, h_hi) // 32 * 32
     return (w, h)
 
 
