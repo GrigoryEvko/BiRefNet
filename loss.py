@@ -64,6 +64,10 @@ class IoULoss(torch.nn.Module):
 
 
 class StructureLoss(torch.nn.Module):
+    # Marks a criterion as consuming raw logits. PixLoss feeds it pred_lvl
+    # before sigmoid; criteria without this attribute receive sigmoid'd preds.
+    consumes_logits = True
+
     def __init__(self):
         super(StructureLoss, self).__init__()
 
@@ -141,7 +145,9 @@ class PixLoss(nn.Module):
         # bce takes logits; everything else (iou/ssim/mae/...) takes sigmoid'd preds.
         # nn.BCELoss is autocast-unsafe in torch >= 2.x; use BCEWithLogitsLoss.
         if 'bce' in self.lambdas_pix_last and self.lambdas_pix_last['bce']:
-            self.criterions_last['bce'] = nn.BCEWithLogitsLoss()
+            bce = nn.BCEWithLogitsLoss()
+            bce.consumes_logits = True  # tagged so PixLoss feeds it raw logits
+            self.criterions_last['bce'] = bce
         if 'iou' in self.lambdas_pix_last and self.lambdas_pix_last['iou']:
             self.criterions_last['iou'] = IoULoss()
         if 'iou_patch' in self.lambdas_pix_last and self.lambdas_pix_last['iou_patch']:
@@ -159,9 +165,6 @@ class PixLoss(nn.Module):
         if 'structure' in self.lambdas_pix_last and self.lambdas_pix_last['structure']:
             self.criterions_last['structure'] = StructureLoss()
 
-    # Criteria that consume raw logits — everything else gets sigmoid'd inputs.
-    _LOGIT_CRITERIA = ('bce', 'structure')
-
     def forward(self, scaled_preds, gt, pix_loss_lambda=1.0):
         loss = 0.
         loss_dict = {}
@@ -173,7 +176,10 @@ class PixLoss(nn.Module):
                 )
             pred_sig = None  # lazy: only sigmoid if a non-logit criterion needs it
             for criterion_name, criterion in self.criterions_last.items():
-                if criterion_name in self._LOGIT_CRITERIA:
+                # Per-criterion `consumes_logits` attribute beats a hardcoded
+                # name list: adding a new logit-consuming loss only requires
+                # setting the flag on its class.
+                if getattr(criterion, 'consumes_logits', False):
                     inp = pred_lvl
                 else:
                     if pred_sig is None:
