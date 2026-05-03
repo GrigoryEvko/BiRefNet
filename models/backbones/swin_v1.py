@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -388,8 +390,9 @@ class BasicLayer(nn.Module):
         self.shift_size = window_size // 2
         self.depth = depth
         self.use_checkpoint = use_checkpoint
-        # Plain dict (not Buffer/Module/Parameter) → not serialized in state_dict.
-        self._attn_mask_cache: dict = {}
+        # OrderedDict (not Buffer/Module/Parameter) → not serialized in state_dict.
+        # Used as an LRU cache: move_to_end on hit, popitem(last=False) to evict.
+        self._attn_mask_cache: OrderedDict = OrderedDict()
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -417,19 +420,21 @@ class BasicLayer(nn.Module):
         """Build (or look up) the SW-MSA attention mask for an H x W feature map.
 
         The mask depends only on (Hp, Wp, window_size, shift_size, dtype, device);
-        cache up to 4 entries to keep VRAM bounded under dynamic-size training.
-        At 1024² Swin stage 1 this saves ~12 MB of zeros + slice writes per call.
+        cache up to 4 entries with LRU eviction so an active size doesn't get
+        evicted when a new transient size shows up. At 1024² Swin stage 1 this
+        saves ~12 MB of zeros + slice writes per call.
         """
         Hp = ((H + self.window_size - 1) // self.window_size) * self.window_size
         Wp = ((W + self.window_size - 1) // self.window_size) * self.window_size
         key = (Hp, Wp, dtype, str(device))
         cached = self._attn_mask_cache.get(key)
         if cached is not None:
+            # Mark as most-recently-used — true LRU semantics.
+            self._attn_mask_cache.move_to_end(key)
             return cached
         if len(self._attn_mask_cache) >= 4:
-            # Drop oldest entry (insertion order). Avoids unbounded growth
-            # when the model is exercised across many shapes.
-            self._attn_mask_cache.pop(next(iter(self._attn_mask_cache)))
+            # Evict least-recently-used entry, not least-recently-inserted.
+            self._attn_mask_cache.popitem(last=False)
         img_mask = torch.zeros((1, Hp, Wp, 1), device=device)
         h_slices = (slice(0, -self.window_size),
                     slice(-self.window_size, -self.shift_size),

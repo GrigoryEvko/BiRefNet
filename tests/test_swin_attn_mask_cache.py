@@ -62,6 +62,29 @@ def test_attn_mask_cache_evicts_oldest_at_5th_unique_shape():
     assert not any(k[0] == 28 and k[1] == 28 for k in keys)
 
 
+def test_attn_mask_cache_lru_keeps_active_size():
+    """LRU semantics: a recently-used entry should NOT be evicted just
+    because it was inserted earlier. Insert 4 shapes, re-touch the first,
+    insert a 5th — the second-inserted should be evicted, not the first.
+    """
+    layer = _make_layer()
+    cpu = torch.device("cpu")
+    keys_used = []
+    for H, W in [(28, 28), (35, 35), (42, 42), (49, 49)]:
+        layer._get_attn_mask(H, W, torch.float32, cpu)
+        keys_used.append((H, W))
+    # Re-touch the first shape — under LRU this should bump it to most-recent.
+    layer._get_attn_mask(28, 28, torch.float32, cpu)
+    # Now insert a 5th shape, triggering eviction.
+    layer._get_attn_mask(56, 56, torch.float32, cpu)
+    keys = list(layer._attn_mask_cache.keys())
+    # 28×28 should still be present (most-recently-used). 35×35 (second-
+    # inserted) is now the LRU and should have been evicted.
+    sizes = {(k[0], k[1]) for k in keys}
+    assert (28, 28) in sizes, "LRU evicted a recently-used entry"
+    assert (35, 35) not in sizes, "LRU should have evicted second-inserted (oldest by access)"
+
+
 def test_attn_mask_cache_distinct_dtype_keys():
     """Direct cache exercise: same (H, W) but different dtype → different key."""
     layer = _make_layer()
