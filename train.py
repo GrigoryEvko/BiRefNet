@@ -31,7 +31,7 @@ if not _alloc_conf_was_user_set and not _torch_version_at_least(2, 5, 0):
     # user's own configuration.
     os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
 
-from config import Config
+from birefnet_config import Config
 from loss import PixLoss, ClsLoss
 from dataset import MyData
 from models.birefnet import BiRefNet

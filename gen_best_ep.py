@@ -1,7 +1,7 @@
 import os
 from glob import glob
 import numpy as np
-from config import Config
+from birefnet_config import Config
 
 
 config = Config()

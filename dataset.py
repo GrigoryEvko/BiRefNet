@@ -8,7 +8,7 @@ from torch.utils import data
 from torchvision import transforms
 
 from image_proc import preproc
-from config import Config
+from birefnet_config import Config
 from utils import path_to_image
 
 

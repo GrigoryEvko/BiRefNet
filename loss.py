@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
-from config import Config
+from birefnet_config import Config
 
 
 class ContourLoss(torch.nn.Module):

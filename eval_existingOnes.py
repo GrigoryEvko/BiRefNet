@@ -4,7 +4,7 @@ from glob import glob
 import prettytable as pt
 
 from evaluation.metrics import evaluator, sort_and_round_scores
-from config import Config
+from birefnet_config import Config
 
 
 config = Config()
