@@ -9,7 +9,7 @@ from contextlib import nullcontext
 from dataset import MyData
 from models.birefnet import BiRefNet
 from utils import save_tensor_img, check_state_dict
-from config import Config
+from birefnet_config import Config
 
 
 config = Config()

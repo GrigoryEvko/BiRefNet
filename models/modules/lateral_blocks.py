@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from config import Config
+from birefnet_config import Config
 
 
 config = Config()

@@ -2,11 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from kornia.filters import laplacian
 from huggingface_hub import PyTorchModelHubMixin
 
-from config import Config
-from dataset import class_labels_TR_sorted
+from birefnet_config import Config
 from models.backbones.build_backbone import build_backbone
 from models.modules.decoder_blocks import BasicDecBlk, ResBlk
 from models.modules.lateral_blocks import BasicLatBlk
@@ -58,6 +56,11 @@ class BiRefNet(
         channels = self.config.lateral_channels_in_collection
 
         if self.config.auxiliary_classification:
+            # Lazy: dataset.py transitively imports torchvision/tqdm/opencv/image_proc.
+            # auxiliary_classification is False at inference, so this whole branch
+            # is dead — keep the import scoped here so deployment doesn't need
+            # the training-time data-loading deps.
+            from dataset import class_labels_TR_sorted
             self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
             self.cls_head = nn.Sequential(
                 nn.Linear(channels[0], len(class_labels_TR_sorted))
@@ -145,6 +148,10 @@ class BiRefNet(
         ########## Decoder ##########
         features = [x, x1, x2, x3, x4]
         if self.training and self.config.out_ref:
+            # Lazy: kornia is heavy (~100 MB transitive deps incl. matplotlib/
+            # scipy) and only needed in the training branch. Importing here
+            # keeps the inference container kornia-free.
+            from kornia.filters import laplacian
             features.append(laplacian(torch.mean(x, dim=1).unsqueeze(1), kernel_size=5))
         scaled_preds = self.decoder(features)
         return scaled_preds, class_preds
