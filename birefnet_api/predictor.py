@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import nullcontext
 from typing import Iterable, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
@@ -206,6 +205,21 @@ class BiRefNetPredictor:
         self.max_pixels = int(max_pixels) if max_pixels is not None else None
 
         model = model.eval().to(self.device)
+        # Cast the entire model to amp_dtype (params + buffers) instead of
+        # relying on torch.amp.autocast at forward time. Autocast keeps
+        # BN/LN/etc. in fp32 internally, so under autocast the model's
+        # *internal* tensor dtypes alternate between fp32 (after BN/LN) and
+        # bf16 (after conv/linear). torch.compile/Dynamo guards on those
+        # internal dtypes; with seven buckets and any fp32↔bf16 toggling on
+        # different shapes, recompiles stack up and hit the per-function
+        # cap of 8 — at which point Dynamo falls back to eager and the
+        # cache we baked is partially wasted. Casting the model to a single
+        # dtype gives a deterministic graph: one (shape, dtype) pair per
+        # bucket, no autocast policy variability. fp16/bf16 BN works
+        # natively in torch 2.x; the precision delta vs fp32-BN under
+        # autocast is negligible at inference.
+        if self.amp_dtype is not None:
+            model = model.to(self.amp_dtype)
         if self.channels_last:
             model = model.to(memory_format=torch.channels_last)
         for p in model.parameters():
@@ -214,8 +228,12 @@ class BiRefNetPredictor:
             model = torch.compile(model, mode=compile_mode)
         self.model = model
 
-        self._mean = torch.tensor(_IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
-        self._std = torch.tensor(_IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
+        # Mean/std at amp_dtype so (x - mean) / std stays in target dtype
+        # without broadcasting promotion. Saves a fp32 intermediate per
+        # forward and removes a dtype-guard variable from Dynamo's view.
+        buf_dtype = self.amp_dtype if self.amp_dtype is not None else torch.float32
+        self._mean = torch.tensor(_IMAGENET_MEAN, device=self.device, dtype=buf_dtype).view(1, 3, 1, 1)
+        self._std = torch.tensor(_IMAGENET_STD, device=self.device, dtype=buf_dtype).view(1, 3, 1, 1)
 
     # --- factories ---------------------------------------------------------
 
@@ -424,12 +442,7 @@ class BiRefNetPredictor:
         x = _pil_to_rgb_tensor(bucket_pil, self.device).unsqueeze(0)
         if (pt, pb, pl, pr) != (0, 0, 0, 0):
             x = F.pad(x, (pl, pr, pt, pb), mode="replicate")
-        if self.normalize:
-            x = (x - self._mean) / self._std
-        if self.channels_last:
-            x = x.contiguous(memory_format=torch.channels_last)
-        if self.amp_dtype is not None and self.device.type == "cuda":
-            x = x.to(self.amp_dtype)
+        x = self._finalize_input(x)
 
         mask = self._forward(x)  # [1,1,h,w] fp32 (sigmoid is now in fp32 in _forward)
         # Crop the letterbox padding from the mask before upsample.
@@ -496,12 +509,7 @@ class BiRefNetPredictor:
         # so they can be GC'd while the model forward runs (saves B × C × H ×
         # W × 4 bytes of peak VRAM at HR batch).
         del tensors
-        if self.normalize:
-            x = (x - self._mean) / self._std
-        if self.channels_last:
-            x = x.contiguous(memory_format=torch.channels_last)
-        if self.amp_dtype is not None and self.device.type == "cuda":
-            x = x.to(self.amp_dtype)
+        x = self._finalize_input(x)
 
         masks = self._forward(x)  # [B,1,bh,bw]
         # Crop the letterbox padding from each mask, then upsample to the
@@ -628,19 +636,40 @@ class BiRefNetPredictor:
             bw = max(m, ((int(bw * scale) + m // 2) // m) * m)
         return (bh, bw)
 
+    def _finalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Single normalisation + memory-format + dtype pipeline.
+
+        Used by predict / predict_batch / warmup so they all build the same
+        compiled graph. Order matters:
+
+          1. Cast to amp_dtype FIRST so every downstream op runs in target
+             dtype. Doing this last (the previous order) left fp32
+             intermediates from `(x - mean) / std`, which under autocast
+             cascade into different internal dtypes per bucket and
+             explode Dynamo's recompile counter past its 8-per-function cap.
+          2. (x - mean) / std with already-amp_dtype mean/std (set in
+             __init__) so subtraction stays in target dtype with no
+             broadcasting promotion.
+          3. channels_last reformat last — channels_last is a memory
+             layout, doesn't change dtype.
+        """
+        if self.amp_dtype is not None and x.dtype != self.amp_dtype:
+            x = x.to(self.amp_dtype)
+        if self.normalize:
+            x = (x - self._mean) / self._std
+        if self.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+        return x
+
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        ctx = (
-            torch.amp.autocast("cuda", dtype=self.amp_dtype)
-            if (self.amp_dtype is not None and self.device.type == "cuda")
-            else nullcontext()
-        )
+        # No autocast: model was already cast to amp_dtype in __init__, so
+        # there's no fp32-vs-bf16 ambiguity for Dynamo to guard on.
         try:
-            with ctx:
-                out = self.model(x)
-                if isinstance(out, (list, tuple)):
-                    logits = out[-1]
-                else:
-                    logits = out
+            out = self.model(x)
+            if isinstance(out, (list, tuple)):
+                logits = out[-1]
+            else:
+                logits = out
             # Sigmoid in fp32 (matches inference.py): bf16 sigmoid quantizes
             # values near 1.0 into ~5 bins (7-bit mantissa), losing useful
             # mask precision. The upcast cost is on a small pre-upsample
@@ -683,13 +712,13 @@ class BiRefNetPredictor:
         targets = list(shapes or self.buckets or [])
         for hw in targets:
             h, w = int(hw[0]), int(hw[1])
-            x = torch.zeros(1, 3, h, w, device=self.device)
-            if self.normalize:
-                x = (x - self._mean) / self._std
-            if self.channels_last:
-                x = x.contiguous(memory_format=torch.channels_last)
-            if self.amp_dtype is not None and self.device.type == "cuda":
-                x = x.to(self.amp_dtype)
+            # Match predict()'s pipeline exactly: synthesize an fp32 tensor
+            # then route through _finalize_input. This guarantees the
+            # compiled graph the warmup populates is the SAME graph predict
+            # will hit at request time — no second compile from
+            # warmup-vs-predict divergence.
+            x = torch.zeros(1, 3, h, w, device=self.device, dtype=torch.float32)
+            x = self._finalize_input(x)
             self._forward(x)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
