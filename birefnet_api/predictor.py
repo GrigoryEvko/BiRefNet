@@ -225,6 +225,32 @@ class BiRefNetPredictor:
         for p in model.parameters():
             p.requires_grad_(False)
         if compile:
+            # Swin's pyramid creates 4 stages with different (H, W) — with
+            # 7 buckets that's >8 shape variants per inner function (window
+            # partition, windowed attention, MLP). Default recompile cap of
+            # 8 would force eager fallback for 9th+ variant; bump high
+            # enough that all 7-bucket × 4-stage combinations compile
+            # cleanly. force_parameter_static_shapes=False is what the
+            # 'relative_position_bias_table size mismatch' warning
+            # explicitly recommends — Swin's per-stage rpb table param has
+            # different sizes per stage, and Dynamo defaults to guarding
+            # parameters as static.
+            try:
+                # Empirical: 7-bucket Swin-L at HR triggers ≥80 unique shape
+                # combinations on inner window-attention forward frames
+                # (4 stages × varying window-flattened sizes × multiple
+                # attention configs). Default cap of 8 forces eager fallback;
+                # 64 still capped on window-attn forward in measurements.
+                # 256 leaves enough headroom that no inner frame hits the
+                # cap on this workload and the cache file we bake covers
+                # every (bucket, stage, window) tuple cleanly.
+                torch._dynamo.config.recompile_limit = max(
+                    int(getattr(torch._dynamo.config, "recompile_limit", 8)),
+                    256,
+                )
+                torch._dynamo.config.force_parameter_static_shapes = False
+            except AttributeError:
+                pass
             model = torch.compile(model, mode=compile_mode)
         self.model = model
 
