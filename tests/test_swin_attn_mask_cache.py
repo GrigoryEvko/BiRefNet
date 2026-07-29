@@ -6,6 +6,7 @@ We now cache up to 4 entries keyed by (Hp, Wp, dtype, device).
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -95,19 +96,57 @@ def test_attn_mask_cache_distinct_dtype_keys():
     assert len(layer._attn_mask_cache) == 2
 
 
-def test_attn_mask_avoids_neg_inf_under_bf16():
-    """bf16 has no inf representation — using float('-inf').to(bf16) saturates
-    to the dtype min, and a softmax over an all-min row would NaN. We now use
-    finfo.min/2 which stays representable.
+def test_attn_mask_sentinel_is_bounded():
+    """The masked-out sentinel must be SMALL, not near the dtype maximum.
+
+    This test previously asserted the opposite, on a false premise: "bf16 has no
+    inf representation — float('-inf').to(bf16) saturates to the dtype min".
+    bfloat16 has fp32's 8 exponent bits and represents inf natively:
+
+        torch.tensor(float('-inf')).to(torch.bfloat16)  ->  -inf
+
+    The sentinel that premise justified, finfo.min/2 = -1.69e38, has no headroom
+    for the log2(e) rescaling fused attention kernels apply when folding softmax
+    into exp2 — (m + m) * 1.4427 overflows fp32 to -inf, and one -inf minus -inf
+    in the row-max subtraction NaNs the entire row. That NaN reaches the output,
+    survives clamp(0, 1), and casts to an all-zero uint8 mask, which is how
+    eu-north-1 served fully transparent mattes for six days with HTTP 200 and a
+    healthy /health.
+
+    So: still finite (the original property, kept), but now also bounded well
+    away from the dtype range so no kernel rescaling can overflow it.
     """
     layer = _make_layer()
     H, W = 28, 28
     cpu = torch.device("cpu")
-    mask = layer._get_attn_mask(H, W, torch.bfloat16, cpu)
-    assert torch.isfinite(mask).all(), "attn_mask contains non-finite values under bf16"
-    # The most-negative entry is finfo.min/2 — still representable.
-    bf16_min = torch.finfo(torch.bfloat16).min
-    assert mask.min().item() >= bf16_min, "mask min underflowed below bf16 representable range"
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        mask = layer._get_attn_mask(H, W, dtype, cpu)
+        assert torch.isfinite(mask).all(), f"attn_mask non-finite under {dtype}"
+        m = mask.min().item()
+        assert m < 0.0, f"{dtype}: nothing was masked"
+
+        # HEADROOM. The sentinel must survive what a fused attention kernel does
+        # to it: it gets added to the score (and possibly to a second mask term)
+        # and the whole sum is rescaled by log2(e) to fold softmax into exp2.
+        # Require room for 8x plus that rescale before reaching the dtype limit.
+        # Stated against the dtype's own range, so this is meaningful for fp16
+        # (max 65504) as well as for bf16/fp32 (max ~3.4e38) — an absolute
+        # threshold, or one phrased as "N orders of magnitude below finfo.min",
+        # would be vacuous for one and impossible for the other.
+        headroom = abs(m) * 8.0 * 1.4426950408889634
+        assert headroom < abs(torch.finfo(dtype).min), (
+            f"{dtype}: sentinel {m:.3e} has no headroom — 8x plus the log2(e) "
+            f"rescale reaches {headroom:.3e} against finfo.min "
+            f"{torch.finfo(dtype).min:.3e}, which overflows to -inf and NaNs "
+            f"the softmax row"
+        )
+
+        # STILL FULLY MASKS. exp(sentinel) must be negligible against the
+        # unmasked weights, or the mask is not doing its job.
+        assert math.exp(m) < 1e-20, (
+            f"{dtype}: sentinel {m:.3e} leaves exp(m)={math.exp(m):.3e} of "
+            f"weight on masked entries"
+        )
 
 
 def test_attn_mask_cache_not_in_state_dict():

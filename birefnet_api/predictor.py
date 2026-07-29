@@ -25,6 +25,19 @@ _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+class NonFiniteMaskError(RuntimeError):
+    """The model produced NaN or Inf in the predicted mask.
+
+    Raised rather than returned because a non-finite mask is INVISIBLE
+    downstream: NaN survives clamp(0, 1) and casts to 0 as uint8, producing a
+    well-formed, fully transparent PNG that is indistinguishable from a
+    legitimate "nothing detected" result. Callers that want to degrade
+    gracefully should catch this explicitly and decide (retry on a different
+    path, fall back to eager, return 503) — the one thing that must not happen
+    is returning zeros as if they were an answer.
+    """
+
+
 def _np_to_uint8(arr: np.ndarray) -> np.ndarray:
     """Convert an HWC or HW numpy array to uint8, auto-detecting common ranges.
 
@@ -700,7 +713,37 @@ class BiRefNetPredictor:
             # values near 1.0 into ~5 bins (7-bit mantissa), losing useful
             # mask precision. The upcast cost is on a small pre-upsample
             # tensor — negligible vs preserving 23-bit precision.
-            return logits.float().sigmoid()
+            mask = logits.float().sigmoid()
+
+            # REFUSE to return a non-finite mask.
+            #
+            # Without this the failure is completely silent and looks healthy.
+            # A NaN mask survives clamp_(0, 1) — clamp propagates NaN, it does
+            # not remove it — and then `(mask * 255).round().astype(np.uint8)`
+            # turns every NaN into 0. The caller gets a well-formed PNG that is
+            # uniformly transparent, HTTP 200, and /health still reports "ok".
+            #
+            # That is not hypothetical. eu-north-1 served exactly this for six
+            # days: every /background/mask response min=0 max=0 mean=0, 100%
+            # transparent, in 0.04s, with nothing in the logs but a NumPy
+            # "invalid value encountered in cast" RuntimeWarning at the cast
+            # site. Nothing upstream of that warning noticed, because a mask of
+            # all zeros is a VALID mask — it just means "nothing here".
+            #
+            # The check is one reduction over the small pre-upsample tensor. It
+            # forces a device sync, which is the price of not shipping silence.
+            if not torch.isfinite(mask).all():
+                n_bad = int((~torch.isfinite(mask)).sum())
+                raise NonFiniteMaskError(
+                    f"model produced {n_bad} non-finite values out of "
+                    f"{mask.numel()} at input {tuple(x.shape)} dtype={x.dtype}. "
+                    f"A NaN mask casts to an all-zero (fully transparent) PNG, "
+                    f"so this is raised rather than returned. Most likely cause "
+                    f"is an attention-mask sentinel large enough to overflow "
+                    f"inside a fused attention kernel — see the neg_large note "
+                    f"in models/backbones/swin_v1.py."
+                )
+            return mask
         except torch.cuda.OutOfMemoryError as e:
             # Be defensive: empty_cache() / mem_get_info() can themselves
             # raise on a corrupted CUDA context (the rotation pattern your
