@@ -493,18 +493,28 @@ class BasicLayer(nn.Module):
         # image, torch 2.13:
         #     torch.tensor(float('-inf')).to(torch.bfloat16)  ->  -inf, isinf=True
         #
-        # And the sentinel it chose is actively dangerous. Fused attention
-        # kernels (SDPA's flash/mem-efficient backends, and whatever Inductor
-        # lowers this to under max_autotune) fold the softmax into exp2 by
-        # scaling scores by log2(e) = 1.4427. A mask within a factor of ~2 of the
-        # dtype maximum has no headroom for that:
-        #     -1.69e38 * 1.4427            = -2.44e38
-        #     (mask + mask) * 1.4427       = -4.89e38  -> overflows fp32 -> -inf
-        # and one -inf - (-inf) in the row-max subtraction is NaN for the whole
-        # row. NaN then propagates through the network to the output; clamp_(0,1)
-        # does NOT remove it, and the uint8 cast in the predictor turns it into
-        # ZERO. That is exactly the failure observed in eu-north-1: every
-        # /background/mask response an all-zero matte, HTTP 200, health "ok".
+        # And the sentinel it chose has no headroom. Fused attention kernels
+        # (SDPA's flash/mem-efficient backends, and whatever Inductor lowers this
+        # to under max_autotune) fold softmax into exp2 by scaling scores by
+        # log2(e) = 1.4427. A mask within a factor of ~2 of the dtype maximum
+        # cannot survive that — measured, fp32:
+        #     -1.69e38 * 1.4427        = -2.44e38   finite
+        #     (mask + mask) * 1.4427   = -inf       NOT finite
+        # and one -inf minus -inf in the row-max subtraction NaNs the whole row.
+        #
+        # SCOPE — read this before crediting or blaming the change.
+        # This is HARDENING against a demonstrated hazard, on a premise that was
+        # demonstrably false. It is NOT an established fix for the eu-north-1
+        # incident (all-zero mattes from the AOTI path). Measured on an RTX PRO
+        # 6000 against the SHIPPED 896x1152 bundle with a real photograph:
+        #     eager: NaN=0  min=0    max=255  opaque=61.9%  centre-corner +129.0
+        #     AOTI:  NaN=0  min=196  max=255  opaque=99.7%  centre-corner   +3.6
+        # The AOTI output is FINITE, merely saturated. At that bucket the
+        # divergence is therefore NOT an overflow — something shape-dependent is
+        # captured wrongly at export, which is the open question. A genuine NaN
+        # was separately seen in the serving path (NumPy "invalid value
+        # encountered in cast" at predictor.py:490), so both failure modes exist;
+        # this sentinel is established as a hazard, not as the cause of either.
         #
         # -100.0 is what upstream Swin (and timm, and HF) use, and it is
         # numerically identical for masking: exp(-100) underflows to 0, so a

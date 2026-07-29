@@ -730,6 +730,14 @@ class BiRefNetPredictor:
             # site. Nothing upstream of that warning noticed, because a mask of
             # all zeros is a VALID mask — it just means "nothing here".
             #
+            # NOTE this guard catches only the NON-FINITE failure. It is NOT a
+            # completeness check on the mask, and it would NOT have caught the
+            # other AOTI defect measured alongside it: at the 896x1152 bucket the
+            # exported bundle returns finite but saturated output (min=196,
+            # 99.7% opaque, centre-corner +3.6 against eager's +129.0). Wrong and
+            # finite still gets served. Detecting THAT needs a parity check
+            # against eager on a real image at bake time, not a runtime assert.
+            #
             # The check is one reduction over the small pre-upsample tensor. It
             # forces a device sync, which is the price of not shipping silence.
             if not torch.isfinite(mask).all():
@@ -738,10 +746,7 @@ class BiRefNetPredictor:
                     f"model produced {n_bad} non-finite values out of "
                     f"{mask.numel()} at input {tuple(x.shape)} dtype={x.dtype}. "
                     f"A NaN mask casts to an all-zero (fully transparent) PNG, "
-                    f"so this is raised rather than returned. Most likely cause "
-                    f"is an attention-mask sentinel large enough to overflow "
-                    f"inside a fused attention kernel — see the neg_large note "
-                    f"in models/backbones/swin_v1.py."
+                    f"so this is raised rather than returned."
                 )
             return mask
         except torch.cuda.OutOfMemoryError as e:
