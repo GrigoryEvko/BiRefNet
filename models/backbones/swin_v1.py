@@ -484,11 +484,35 @@ class BasicLayer(nn.Module):
         mask_windows = window_partition(img_mask, self.window_size)
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        # bf16 has no inf representation: float('-inf').to(bf16) saturates to
-        # the dtype min, and softmax over an all-min row produces NaN.
-        # finfo.min/2 stays representable, leaves headroom when added to
-        # attention scores, and still drives softmax weight to ~0.
-        neg_large = torch.finfo(dtype).min / 2.0
+        # The masked-out sentinel. MUST stay small in magnitude — see below.
+        #
+        # This was finfo(dtype).min / 2.0 (-1.69e38 for bf16), justified by the
+        # note "bf16 has no inf representation: float('-inf').to(bf16) saturates
+        # to the dtype min". That premise is false. bfloat16 has fp32's 8
+        # exponent bits, so it represents inf natively — measured on the serving
+        # image, torch 2.13:
+        #     torch.tensor(float('-inf')).to(torch.bfloat16)  ->  -inf, isinf=True
+        #
+        # And the sentinel it chose is actively dangerous. Fused attention
+        # kernels (SDPA's flash/mem-efficient backends, and whatever Inductor
+        # lowers this to under max_autotune) fold the softmax into exp2 by
+        # scaling scores by log2(e) = 1.4427. A mask within a factor of ~2 of the
+        # dtype maximum has no headroom for that:
+        #     -1.69e38 * 1.4427            = -2.44e38
+        #     (mask + mask) * 1.4427       = -4.89e38  -> overflows fp32 -> -inf
+        # and one -inf - (-inf) in the row-max subtraction is NaN for the whole
+        # row. NaN then propagates through the network to the output; clamp_(0,1)
+        # does NOT remove it, and the uint8 cast in the predictor turns it into
+        # ZERO. That is exactly the failure observed in eu-north-1: every
+        # /background/mask response an all-zero matte, HTTP 200, health "ok".
+        #
+        # -100.0 is what upstream Swin (and timm, and HF) use, and it is
+        # numerically identical for masking: exp(-100) underflows to 0, so a
+        # masked entry contributes nothing to the weighted sum. Verified on the
+        # serving image that softmax over an all-masked row gives the same
+        # uniform result for both sentinels. It leaves ~36 orders of magnitude of
+        # headroom, so no kernel rescaling can overflow it.
+        neg_large = -100.0
         attn_mask = (
             attn_mask.masked_fill(attn_mask != 0, neg_large)
                      .masked_fill(attn_mask == 0, 0.0)
