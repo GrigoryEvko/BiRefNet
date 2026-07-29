@@ -730,13 +730,16 @@ class BiRefNetPredictor:
             # site. Nothing upstream of that warning noticed, because a mask of
             # all zeros is a VALID mask — it just means "nothing here".
             #
-            # NOTE this guard catches only the NON-FINITE failure. It is NOT a
-            # completeness check on the mask, and it would NOT have caught the
-            # other AOTI defect measured alongside it: at the 896x1152 bucket the
-            # exported bundle returns finite but saturated output (min=196,
-            # 99.7% opaque, centre-corner +3.6 against eager's +129.0). Wrong and
-            # finite still gets served. Detecting THAT needs a parity check
-            # against eager on a real image at bake time, not a runtime assert.
+            # NOTE this guard catches only the NON-FINITE failure, and the
+            # incident that motivated it was NOT non-finite. The real defect was
+            # a memory-layout mismatch: the AOTI bundle was exported on a
+            # contiguous tensor while this class feeds channels_last, giving
+            # finite-but-saturated output (min=196, 99.7% opaque, centre-corner
+            # +3.6 vs eager's +129.0). Wrong and finite still gets served, and no
+            # runtime assert on the OUTPUT can catch that. It is caught at the
+            # input instead — aoti/bundle.py records input_strides and refuses a
+            # mismatch (BundleLayoutMismatch). This guard remains for genuine
+            # NaN, which is cheap to check and catastrophic to serve.
             #
             # The check is one reduction over the small pre-upsample tensor. It
             # forces a device sync, which is the price of not shipping silence.

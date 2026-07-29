@@ -502,19 +502,19 @@ class BasicLayer(nn.Module):
         #     (mask + mask) * 1.4427   = -inf       NOT finite
         # and one -inf minus -inf in the row-max subtraction NaNs the whole row.
         #
-        # SCOPE — read this before crediting or blaming the change.
-        # This is HARDENING against a demonstrated hazard, on a premise that was
-        # demonstrably false. It is NOT an established fix for the eu-north-1
-        # incident (all-zero mattes from the AOTI path). Measured on an RTX PRO
-        # 6000 against the SHIPPED 896x1152 bundle with a real photograph:
-        #     eager: NaN=0  min=0    max=255  opaque=61.9%  centre-corner +129.0
-        #     AOTI:  NaN=0  min=196  max=255  opaque=99.7%  centre-corner   +3.6
-        # The AOTI output is FINITE, merely saturated. At that bucket the
-        # divergence is therefore NOT an overflow — something shape-dependent is
-        # captured wrongly at export, which is the open question. A genuine NaN
-        # was separately seen in the serving path (NumPy "invalid value
-        # encountered in cast" at predictor.py:490), so both failure modes exist;
-        # this sentinel is established as a hazard, not as the cause of either.
+        # SCOPE — this is HARDENING, and it fixed nothing that was broken.
+        # The eu-north-1 incident (wrong mattes from the AOTI path) has since
+        # been root-caused, and it was not this: AOTInductor bakes the example
+        # input's STRIDES, the bake exported on contiguous torch.randn, and
+        # BiRefNetPredictor feeds channels_last — so every request ran a bundle
+        # compiled for a layout it never received. Measured, one bundle, one
+        # photograph: contiguous -> centre-corner +129.1 (correct),
+        # channels_last -> +3.7 (saturated garbage), eager +129.0 for both.
+        # Fixed in model_serving 4c7477a (export channels_last + record
+        # input_strides in the manifest and refuse a mismatch at load).
+        #
+        # This change stays because the premise it replaced was false and the
+        # value it replaced is genuinely fragile — not because it cured anything.
         #
         # -100.0 is what upstream Swin (and timm, and HF) use, and it is
         # numerically identical for masking: exp(-100) underflows to 0, so a
