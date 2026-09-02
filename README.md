@@ -221,6 +221,8 @@ You can access the **inference API** service of BiRefNet on [FAL](https://fal.ai
 
 
 <details><summary><b>ONNX</b> conversion:</summary>
+    
+**Try to use the latest ONNX if possible!** For instance, the native DeformConv in opset-22 has a large improvement on memory / inference-time cost compared to legacy ones.
 
 > We converted from `.pth` weights files to `.onnx` files.  
 > We referred a lot to the [Kazuhito00/BiRefNet-ONNX-Sample](https://github.com/Kazuhito00/BiRefNet-ONNX-Sample), many thanks to @Kazuhito00.
