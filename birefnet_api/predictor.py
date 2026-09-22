@@ -344,13 +344,19 @@ class BiRefNetPredictor:
         params, 423 MB FP16 safetensors → 852 MB FP32 model):
 
           1. Construct the model on torch.device('meta'): zero allocation.
-          2. to_empty(target_device): allocates uninitialised FP32 params on
-             the destination (GPU when CUDA available). 852 MB target alloc.
-          3. safetensors.load_file(device=target): file's native dtype loads
-             straight into target memory. +451 MB target peak (FP16 sd).
+             The cast to the predictor dtype and channels_last apply there.
+          2. to_empty(target_device): allocates uninitialised params on the
+             destination in their final dtype and layout (424 MiB in bf16).
+          3. safetensors.load_file(device=target): the FP16 file loads
+             straight into target memory, with the pread backend on a GPU.
+             +424 MiB target peak (FP16 sd).
           4. load_state_dict(strict=False, assign=False): in-place copy_()
-             with dtype conversion FP16→FP32 into the already-allocated
+             with dtype conversion FP16→bf16 into the already-allocated
              params. No extra allocation; sd freed at del.
+
+        Measured on 2026-09-22 (bf16, GPU): GPU peak 848 MiB (was 1268 MiB
+        with FP32 params and a cast copy). The read maps no page of the file
+        (the mmap read mapped all 424 MiB of it). The weights are bit-equal.
 
         vs. the legacy CPU→GPU staging path (fresh-process measurements):
           - CPU peak RSS: 1.57 GB → was 2.27 GB (saves ~700 MB host RAM)
@@ -374,22 +380,38 @@ class BiRefNetPredictor:
         # weights land where the model will live.
         device_arg = kwargs.get("device", "auto")
         target_dev = cls._resolve_device(device_arg)
+        amp_dtype = cls._resolve_dtype(kwargs.get("dtype", "bf16"))
+        channels_last = bool(kwargs.get("channels_last", True)) and target_dev.type == "cuda"
 
         try:
             with torch.device("meta"):
                 model = BiRefNet(bb_pretrained=False)
+            # The cast and the memory format that __init__ applies go on the
+            # meta model, where they change no storage. to_empty then
+            # allocates each parameter and buffer on target_dev in its final
+            # dtype and layout, so no FP32 copy and no cast copy of the model
+            # ever exists. __init__ then finds both already applied.
+            if amp_dtype is not None:
+                model = model.to(amp_dtype)
+            if channels_last:
+                model = model.to(memory_format=torch.channels_last)
             # to_empty allocates uninitialised storage on target_dev for every
             # parameter and buffer of the meta-built module (deep, not just
-            # top-level). Result: model has FP32 params on GPU, garbage data.
+            # top-level). The data is garbage until the copy below.
             model = model.to_empty(device=target_dev)
 
+            # A read to the GPU uses the pread backend of safetensors, which
+            # maps no page of the file into the process. The mmap backend
+            # maps the file, and the pages count in the resident memory of
+            # the process until the file closes.
             sd_device = "cuda" if target_dev.type == "cuda" else "cpu"
-            sd = load_file(os.fspath(path), device=sd_device)
+            sd = load_file(os.fspath(path), device=sd_device,
+                           backend="pread" if sd_device == "cuda" else "mmap")
             sd = check_state_dict(sd)
 
-            # assign=False: in-place copy_() preserves the FP32 storage from
-            # to_empty and does dtype conversion FP16→FP32 during the copy.
-            # assign=True would replace params with the FP16 sd tensors,
+            # assign=False: in-place copy_() keeps the storage from to_empty
+            # and converts the FP16 file tensors to its dtype during the
+            # copy. assign=True would replace params with the FP16 sd tensors,
             # which corrupts BatchNorm forward (BN under autocast wants
             # FP32 weights — silently produces "Expected weight to have
             # type Float but got Half" at runtime).
@@ -407,6 +429,10 @@ class BiRefNetPredictor:
                     raise RuntimeError(msg + " — pass strict=False to tolerate")
                 _log.warning(msg)
             del sd
+            if sd_device == "cuda":
+                # safetensors reads to the GPU through a pinned staging
+                # buffer, and the PyTorch host cache keeps it after the read.
+                torch.accelerator.empty_host_cache()
             # The predictor's __init__ will call .to(device); already on
             # target_dev so it's a no-op (PyTorch fast-paths same-device .to).
             return cls(model, **kwargs)
@@ -622,7 +648,9 @@ class BiRefNetPredictor:
             return torch.device("mps")
         return torch.device("cpu")
 
-    def _resolve_dtype(self, dtype) -> Optional[torch.dtype]:
+    @staticmethod
+    def _resolve_dtype(dtype) -> Optional[torch.dtype]:
+        """Give the cast dtype of the model, or None for float32."""
         if dtype is None:
             return None
         if isinstance(dtype, torch.dtype):
